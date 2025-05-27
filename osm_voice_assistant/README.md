@@ -1,15 +1,14 @@
-````markdown
-# OSM Voice Assistant
+# ScreenToSoundscapes Open Street Maps Voice Assistant
 
 A modular Python package that lets you **ask spoken questions** about the world, **query OpenStreetMap**, **summarize** the results via LLaMA, and **speak the answer back** in your cloned voice.
 
 ## ✨ Features
 
-- 🎙️ **Voice input** with OpenAI Whisper (Enter to start/stop + silence detection)
-- 🌍 **Natural language → Overpass API** mapping + OSM data fetch
-- 🧠 **LLaMA summarization** of raw OSM results
-- 🗣️ **Voice cloning & TTS** with OpenVoice + MELo
-- ⚡ CLI, HTTP (FastAPI), and browser/desktop integration
+* 🎧 **Voice input** with OpenAI Whisper (Enter to start/stop + silence detection)
+* 🌍 **Multilingual natural language → Overpass API** mapping + OSM data fetch
+* 🧠 **LLaMA summarization** of raw OSM results
+* 🗣️ **Voice cloning & TTS** with OpenVoice + MELo
+* ⚡ CLI, HTTP (FastAPI), and browser/desktop integration
 
 ---
 
@@ -21,7 +20,7 @@ A modular Python package that lets you **ask spoken questions** about the world,
 git clone git@github.com:myshell-ai/OpenVoice.git
 cd OpenVoice
 pip install -e .
-````
+```
 
 ### 2. Download the OpenVoice Checkpoints
 
@@ -69,7 +68,12 @@ pip install \
   overpy \
   requests \
   llama-cpp-python \
-  transformers
+  transformers \
+  spacy \
+  langdetect \
+  deep-translator \
+  geopy
+python -m spacy download en_core_web_sm
 ```
 
 > 🔧 Also install Whisper CLI manually:
@@ -98,9 +102,9 @@ osm_voice_assistant/
 ├── run_assistant.py              # Main script to run the assistant
 ├── utils/
 │   ├── __init__.py
-│   ├── transcribe.py             # Record + transcribe speech to text
-│   ├── question_to_overpass.py   # Natural language → Overpass API
-│   ├── overpass_to_osm.py        # Fetch and summarize OSM data
+│   ├── transcribe.py             # Record + transcribe speech to text (multilingual)
+│   ├── question_to_overpass.py   # Natural language → Overpass API (supports translation)
+│   ├── overpass_to_osm.py        # Fetch and summarize OSM data with LLaMA
 │   ├── speak.py                  # TTS and voice cloning
 │   └── create_speaker.py         # Extract speaker embedding from reference audio
 ```
@@ -111,73 +115,52 @@ osm_voice_assistant/
 
 ### 1. Create Your Own Voice (Speaker Embedding)
 
-Provide a reference voice clip and generate a speaker embedding:
-
 ```bash
 python utils/create_speaker.py \
   --reference sample_audio/arnold_original.mp3 \
   --speaker-name arnold
 ```
 
-This saves a speaker embedding as:
+Saved to:
 
 ```
 checkpoints_v2/base_speakers/ses/arnold.pth
 ```
 
-You can now use this voice in the assistant.
-
----
-
 ### 2. Run the CLI Assistant
 
 ```bash
-python run_assistant.py
+python run_assistant.py --speaker arnold --language FR --speed 1.1
 ```
+
+Steps:
 
 1. Press **Enter** to start speaking your question.
-2. Press **Enter again** or pause to stop.
+2. Press **Enter** again or pause to stop.
 3. The assistant will:
 
-   * Transcribe audio using Whisper
-   * Translate the question → Overpass API query
-   * Fetch OSM data and summarize via LLaMA
-   * Speak the result in your cloned voice
-
----
+   * Transcribe audio with Whisper (autodetects language)
+   * Translate and parse to Overpass query
+   * Run Overpass QL
+   * Summarize via LLaMA
+   * Speak answer in your cloned voice and chosen language
 
 ### 3. Run the FastAPI Server
-
-Example server code (`server.py`):
-
-```python
-from fastapi import FastAPI
-from utils.transcribe import record_and_transcribe
-from utils.question_to_overpass import parse_question_to_overpass
-from utils.overpass_to_osm import summarize_osm_results
-from utils.speak import speak
-
-app = FastAPI()
-
-@app.get("/ask")
-async def ask():
-    question, lang = record_and_transcribe()
-    osm_json = parse_question_to_overpass(question)
-    summary = summarize_osm_results(osm_json)
-    speak(summary)
-    return {"question": question, "summary": summary}
-```
-
-Run:
 
 ```bash
 uvicorn server:app --reload
 ```
 
-Then access it via:
+Code:
 
-```bash
-http://localhost:8000/ask
+```python
+@app.get("/ask")
+async def ask():
+    question, lang = record_and_transcribe()
+    osm_json = parse_question_to_overpass(question)
+    summary = summarize_osm_results(osm_json)
+    speak(summary, language=lang, speaker_key="arnold")
+    return {"question": question, "summary": summary}
 ```
 
 ---
@@ -186,17 +169,53 @@ http://localhost:8000/ask
 
 * Whisper model size: `transcribe.py` → `whisper.load_model("base")`
 * LLaMA model path: set `LLAMA_MODEL_PATH` in `overpass_to_osm.py`
-* Output folders: change defaults in `transcribe.py`, `speak.py`, etc.
-* Supported speaker languages: check `spk2id` in `speak.py`
+* Output folders: configurable in `transcribe.py`, `speak.py`, etc.
+* Supported speaker languages: check language options and voice file in `create_speaker.py`
 
 ---
 
-## 🪪 License
+## 🌍 Multilingual Support
 
-MIT © Your Name or Organization
-Feel free to fork, adapt, and contribute via GitHub!
+### Language Input:
 
-```
-To Do: version split into multiple language variants (e.g. French) or want badges (e.g. for Python version, license, etc.).
-```
+* `transcribe.py` uses Whisper's automatic language detection.
+* `question_to_overpass.py` uses `langdetect` + `deep_translator` to translate non-English input to English before parsing.
+
+### Language Output:
+
+* `speak.py` uses OpenVoice + MELo to speak in the **chosen target language**.
+* Use `--language FR`, `--language ES`, etc. in CLI or API.
+* You must create voice clones per language using `create_speaker.py`.
+
+### To Add More Languages:
+
+1. Add TTS support and speaker embedding via `create_speaker.py`
+2. Update your CLI or API calls to pass the correct `--language`
+3. Ensure text is translated before speech if needed
+
+---
+
+## 🚨 Known Limitations
+
+* Only French → English translation is supported by default; expand via `deep_translator`
+* Must generate language-specific voice samples in advance
+* LLaMA summarization is language-agnostic but outputs English
+
+---
+
+## 🗑️ License
+
+MIT © Screen2Soundscape
+Fork and build your own voice-based mapping assistant!
+
+---
+
+## ✨ Coming Soon
+
+* [ ] French/Spanish/German full localization
+* [ ] Voice command web UI
+* [ ] RAG integration with OSM wiki tags
+* [ ] Smart fallback if Overpass query fails
+
+---
 
