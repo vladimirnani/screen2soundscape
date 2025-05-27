@@ -59,26 +59,27 @@ def geocode_location(location: str):
     return south, west, north, east
 
 def parse_question(question: str) -> dict:
-    question = detect_and_translate(question)  # translate if needed
+    question = detect_and_translate(question)
     doc = nlp(question.lower())
     params = {
         "tag_key": None, "tag_value": None,
         "bbox": None, "radius": None, "center": None,
-        "mode": "tagged", "place_name": None,
+        "mode": None, "place_name": None,
         "start": None, "end": None, "poi": None,
         "start_coords": None, "end_coords": None, "poi_coords": None,
         "transport": "walk", "wheelchair_only": False
     }
 
-    # Routing pattern
-    m = re.search(r"(walk|drive|bus|train)?\s*from\s+(.+?)\s+to\s+(.+?)(?:\s+(?:past|via)\s+(an|a)?\s*(.+))?$", question, re.IGNORECASE)
+    # 🚦 ROUTING LOGIC
+    m = re.search(r"(walk|drive|bike|bus|train)?\s*from\s+(.+?)\s+to\s+(.+?)(?:\s+(?:past|via)\s+(?:an|a)?\s*(.+))?$", question, re.IGNORECASE)
     if m:
-        mode, start, end, _, poi = m.groups()
-        params["start"] = start.strip()
-        params["end"] = end.strip()
-        params["poi"] = poi.strip() if poi else None
-        params["mode"] = "route_via" if poi else "route_check"
-        if mode: params["transport"] = mode.lower()
+        mode, start, end, poi = m.groups()
+        params.update({
+            "start": start.strip(), "end": end.strip(),
+            "poi": poi.strip() if poi else None,
+            "mode": "route_via" if poi else "route_check",
+            "transport": mode.lower() if mode else "walk"
+        })
         try:
             params["start_coords"] = geocode_point(params["start"])
             params["end_coords"] = geocode_point(params["end"])
@@ -88,33 +89,34 @@ def parse_question(question: str) -> dict:
             print(f"❌ Geocoding error: {e}")
         return params
 
-    # Wheelchair accessible check
+    # 🦽 WHEELCHAIR ACCESSIBILITY CHECK
     m = re.search(r"is\s+(.+?)\s+wheelchair\s+accessible", question, re.IGNORECASE)
     if m:
         location = m.group(1).strip()
         try:
-            params["center"] = geocode_point(location)
-            params["place_name"] = location
-            params["tag_key"] = "wheelchair"
-            params["tag_value"] = "yes"
-            params["mode"] = "tagged"
+            params.update({
+                "center": geocode_point(location),
+                "place_name": location,
+                "tag_key": "wheelchair",
+                "tag_value": "yes",
+                "mode": "generic"
+            })
         except ValueError:
             pass
         return params
 
-    # Nearest accessible supermarket
-    m = re.search(r"(?:nearest|closest)\s+wheelchair\s+accessible\s+supermarket", question, re.IGNORECASE)
-    if m:
+    # 🛒 ACCESSIBLE SUPERMARKET NEARBY
+    if "wheelchair accessible supermarket" in question:
         params.update({
             "tag_key": "shop", "tag_value": "supermarket",
             "wheelchair_only": True, "radius": 1000,
-            "mode": "generic", "center": geocode_point("Amsterdam")
+            "mode": "generic",
+            "center": geocode_point("Amsterdam")  # Default or mock location
         })
         return params
 
-    # Closest toilet
-    m = re.search(r"(?:nearest|closest)\s+toilet", question, re.IGNORECASE)
-    if m:
+    # 🚻 NEAREST TOILET
+    if re.search(r"(?:nearest|closest)\s+toilet", question, re.IGNORECASE):
         params.update({
             "tag_key": "amenity", "tag_value": "toilets",
             "radius": 1000, "mode": "generic",
@@ -122,62 +124,68 @@ def parse_question(question: str) -> dict:
         })
         return params
 
-    # Radius query
+    # 📍 WITHIN X KM OF LOCATION
     m = re.search(r"within\s+(\d+)\s*km\s+of\s+(.+)", question, re.IGNORECASE)
     if m:
-        params["radius"] = int(m.group(1)) * 1000
+        radius_km, loc = m.groups()
         try:
-            params["center"] = geocode_point(m.group(2).strip())
+            params.update({
+                "radius": int(radius_km) * 1000,
+                "center": geocode_point(loc.strip()),
+                "mode": "generic"
+            })
         except ValueError:
             pass
         return params
 
-    # Where is X → use boundary lookup via Overpass
+    # 🗺️ WHERE IS LOCATION (BOUNDARY LOOKUP)
     if re.match(r"where\s+is\s+(.+)", question, re.IGNORECASE):
-        # Try spaCy NER
         for ent in doc.ents:
             if ent.label_ in {"GPE", "LOC"}:
-                place_name = ent.text.strip().title()
-                params["mode"] = "boundary_lookup"
-                params["place_name"] = place_name
+                params.update({
+                    "mode": "boundary_lookup",
+                    "place_name": ent.text.strip().title()
+                })
                 return params
-        
-        # 🛑 Fallback: extract after "where is"
+
+        # Fallback
         m = re.match(r"where\s+is\s+(.+)", question, re.IGNORECASE)
         if m:
-            place_name = m.group(1).strip().title()
-            params["mode"] = "boundary_lookup"
-            params["place_name"] = place_name
+            params.update({
+                "mode": "boundary_lookup",
+                "place_name": m.group(1).strip().title()
+            })
             return params
 
-
-    # Places near X
+    # 🔍 PLACES NEAR X
     m = re.search(r"places\s+near\s+(.+)", question, re.IGNORECASE)
     if m:
         try:
-            params["center"] = geocode_point(m.group(1).strip())
-            params["radius"] = 500
-            params["mode"] = "generic"
+            params.update({
+                "center": geocode_point(m.group(1).strip()),
+                "radius": 500,
+                "mode": "generic"
+            })
             return params
         except ValueError:
             pass
 
-    # Try matching OSM tags
-    location_found = any(ent.label_ in {"GPE", "LOC"} for ent in doc.ents)
+    # 🏷️ TAG MATCHING OR SEMANTIC SEARCH
+    words = [w for w in re.findall(r"\w+", question.lower()) if w not in STOPWORDS and len(w) > 2]
+    found_tag = False
 
-    words = re.findall(r"\w+", question.lower())
     for word in words:
-        if word in STOPWORDS or len(word) < 3:
-            continue
         for term, (key, val) in TAG_MAP.items():
             if word == term:
                 params["tag_key"], params["tag_value"] = key, val
+                found_tag = True
                 break
+        if found_tag:
+            break
 
-    if not params["tag_key"] and not location_found:
+    # Fuzzy match fallback
+    if not found_tag:
         for word in words:
-            if word in STOPWORDS or len(word) < 3:
-                continue
             close = get_close_matches(word, TAG_MAP.keys(), n=1, cutoff=0.8)
             if close:
                 key, val = TAG_MAP[close[0]]
@@ -185,16 +193,27 @@ def parse_question(question: str) -> dict:
                 params["tag_key"], params["tag_value"] = key, val
                 break
 
+    # If we found a tag, set default location logic
     for ent in doc.ents:
         if ent.label_ in {"GPE", "LOC"}:
             try:
                 params["bbox"] = geocode_location(ent.text)
                 params["place_name"] = ent.text
-                break
+                params["mode"] = "bbox"  # Will default to bbox-based in query builder
+                return params
             except ValueError:
                 continue
 
+    # If we have tag but no bbox, try center
+    if params.get("tag_key") and not params.get("mode"):
+        params.update({
+            "center": geocode_point("Berlin"),
+            "radius": 1000,
+            "mode": "generic"
+        })
+
     return params
+
 
 def build_overpass_query(params: dict) -> str:
     mode = params.get("mode")
@@ -297,14 +316,38 @@ if __name__ == "__main__":
 
     if input_arg.lower() == "examples":
         examples = [
-            "Find restaurants in Berlin",
-            "Show me cafes within 2 km of Amsterdam Central Station",
-            "Where is Lyon?",
-            "Look for places near Eiffel Tower",
+            # 🔍 Proximity / Discovery
+            "What is around me right now?",  # generic, radius from current location
+            "Are there any vegan restaurants near me?",  # tag + diet
+            "What are the closest ATMs near Brandenburg Gate?",  # amenity=atm, location-based
+            "Which beaches near Lisbon are wheelchair accessible?",  # natural=beach + wheelchair
+            "Are there baby changing stations in JFK Terminal 4?",  # baby_changing=yes + location
+            "Show me cafes within 2 km of Amsterdam Central Station",  # radius + tag
+            "Find restaurants in Berlin",  # bbox + tag
+            "Look for places near Eiffel Tower",  # generic
+
+            # 📍 Location lookup
+            "Where is Lyon?",  # boundary lookup
+            "Is MOMA wheelchair accessible?",  # specific tag query on a named place
+
+            # 🎭 Thematic queries
+            "What historical sites are near the Colosseum?",  # historic tag + nearby
+            "Show me UNESCO World Heritage sites in India.",  # heritage=unesco + bbox
+            "Where can I find live jazz bars in New Orleans?",  # amenity=bar + music:genre=jazz
+            "What’s a good area for street food in Bangkok?",  # cuisine=street_food
+            "Where can I find hostels near downtown Prague?",  # tourism=hostel
+            "Are there pet-friendly hotels in Zurich?",  # tourism=hotel + pets=yes
+            "Show me all libraries open past 8 PM in central London.",  # amenity=library + opening_hours
+
+            # 🧭 Route-based (handled but not with Overpass directly)
             "Can I drive from Marseille to Nice via Avignon?",
-            "Is MOMA wheelchair accessible?",
-            "Puis-je conduire de Marseille à Nice via Avignon ?"
+            "Puis-je conduire de Marseille à Nice via Avignon ?",
+            "How can I bike from Stanford University to Googleplex?",
+            "What's the fastest public transport route from Heathrow to Covent Garden?",
+            "Can I walk from the Louvre to Notre-Dame along the river?",
+            "How long does it take to drive from Barcelona to Valencia?"
         ]
+
     elif os.path.isfile(input_arg):
         examples = load_text(input_arg)
         save_to_file = True
