@@ -8,10 +8,16 @@ import sys
 import os
 from langdetect import detect
 from deep_translator import GoogleTranslator
+import string
 
 nlp = spacy.load("en_core_web_sm")
 
 STOPWORDS = {"is", "a", "an", "the", "in", "on", "at", "of", "to", "from", "with", "for", "near", "by"}
+
+
+def clean_name(name):
+    return name.strip().strip(string.punctuation)
+
 
 def detect_and_translate(question: str) -> str:
     lang = detect(question)
@@ -44,19 +50,20 @@ def load_tag_map(path):
 
 # Geocoding utilities
 def geocode_point(location: str):
-    geolocator = Nominatim(user_agent="nl_overpass_converter")
+    geolocator = Nominatim(user_agent="nl_overpass_converter", timeout=5)
     place = geolocator.geocode(location, exactly_one=True)
     if not place:
         raise ValueError(f"Could not geocode location: {location}")
     return place.latitude, place.longitude
 
 def geocode_location(location: str):
-    geolocator = Nominatim(user_agent="nl_overpass_converter")
+    geolocator = Nominatim(user_agent="nl_overpass_converter", timeout=5)
     place = geolocator.geocode(location, exactly_one=True)
     if not place:
         raise ValueError(f"Could not geocode location: {location}")
     south, north, west, east = map(float, place.raw["boundingbox"])
     return south, west, north, east
+
 
 def parse_question(question: str) -> dict:
     question = detect_and_translate(question)
@@ -89,40 +96,74 @@ def parse_question(question: str) -> dict:
             print(f"❌ Geocoding error: {e}")
         return params
 
-    # 🦽 WHEELCHAIR ACCESSIBILITY CHECK
+    # ♿ GENERAL WHEELCHAIR ACCESSIBILITY QUERY
+    if "wheelchair accessible" in question:
+        place_type = None
+        for word in re.findall(r"\w+", question.lower()):
+            if word in STOPWORDS or len(word) < 3:
+                continue
+            if word in TAG_MAP:
+                place_type = TAG_MAP[word]
+                break
+            close = get_close_matches(word, TAG_MAP.keys(), n=1, cutoff=0.8)
+            if close:
+                place_type = TAG_MAP[close[0]]
+                print(f"🤖 Interpreted '{word}' as '{close[0]}'")
+                break
+
+        for ent in doc.ents:
+            if ent.label_ in {"GPE", "LOC"}:
+                try:
+                    center = geocode_point(clean_name(ent.text))
+                    if place_type:
+                        key, val = place_type
+                        params.update({
+                            "tag_key": key,
+                            "tag_value": val,
+                            "wheelchair_only": True,
+                            "center": center,
+                            "radius": 1000,
+                            "mode": "generic",
+                            "place_name": ent.text
+                        })
+                        return params
+                except Exception as e:
+                    print(f"❌ Geocoding error for location: {e}")
+
+    # ♿ CHECK IF A NAMED PLACE IS WHEELCHAIR ACCESSIBLE
     m = re.search(r"is\s+(.+?)\s+wheelchair\s+accessible", question, re.IGNORECASE)
     if m:
-        location = m.group(1).strip()
+        location = clean_name(m.group(1).strip())
         try:
+            center = geocode_point(location)
             params.update({
-                "center": geocode_point(location),
+                "center": center,
                 "place_name": location,
                 "tag_key": "wheelchair",
                 "tag_value": "yes",
+                "radius": 500,
                 "mode": "generic"
             })
-        except ValueError:
-            pass
-        return params
-
-    # 🛒 ACCESSIBLE SUPERMARKET NEARBY
-    if "wheelchair accessible supermarket" in question:
-        params.update({
-            "tag_key": "shop", "tag_value": "supermarket",
-            "wheelchair_only": True, "radius": 1000,
-            "mode": "generic",
-            "center": geocode_point("Amsterdam")  # Default or mock location
-        })
+        except Exception as e:
+            print(f"❌ Geocoding error: {e}")
         return params
 
     # 🚻 NEAREST TOILET
     if re.search(r"(?:nearest|closest)\s+toilet", question, re.IGNORECASE):
-        params.update({
-            "tag_key": "amenity", "tag_value": "toilets",
-            "radius": 1000, "mode": "generic",
-            "center": geocode_point("Amsterdam")
-        })
-        return params
+        for ent in doc.ents:
+            if ent.label_ in {"GPE", "LOC"}:
+                try:
+                    center = geocode_point(clean_name(ent.text))
+                    params.update({
+                        "tag_key": "amenity", "tag_value": "toilets",
+                        "radius": 1000,
+                        "mode": "generic",
+                        "center": center,
+                        "place_name": ent.text
+                    })
+                    return params
+                except Exception as e:
+                    print(f"❌ Geocoding error for location in toilet query: {e}")
 
     # 📍 WITHIN X KM OF LOCATION
     m = re.search(r"within\s+(\d+)\s*km\s+of\s+(.+)", question, re.IGNORECASE)
@@ -131,29 +172,27 @@ def parse_question(question: str) -> dict:
         try:
             params.update({
                 "radius": int(radius_km) * 1000,
-                "center": geocode_point(loc.strip()),
+                "center": geocode_point(clean_name(loc)),
                 "mode": "generic"
             })
         except ValueError:
             pass
         return params
 
-    # 🗺️ WHERE IS LOCATION (BOUNDARY LOOKUP)
+    # 🗺️ WHERE IS LOCATION
     if re.match(r"where\s+is\s+(.+)", question, re.IGNORECASE):
         for ent in doc.ents:
             if ent.label_ in {"GPE", "LOC"}:
                 params.update({
                     "mode": "boundary_lookup",
-                    "place_name": ent.text.strip().title()
+                    "place_name": clean_name(ent.text.title())
                 })
                 return params
-
-        # Fallback
         m = re.match(r"where\s+is\s+(.+)", question, re.IGNORECASE)
         if m:
             params.update({
                 "mode": "boundary_lookup",
-                "place_name": m.group(1).strip().title()
+                "place_name": clean_name(m.group(1).title())
             })
             return params
 
@@ -162,7 +201,7 @@ def parse_question(question: str) -> dict:
     if m:
         try:
             params.update({
-                "center": geocode_point(m.group(1).strip()),
+                "center": geocode_point(clean_name(m.group(1).strip())),
                 "radius": 500,
                 "mode": "generic"
             })
@@ -170,20 +209,14 @@ def parse_question(question: str) -> dict:
         except ValueError:
             pass
 
-    # 🏷️ TAG MATCHING OR SEMANTIC SEARCH
+    # 🏷️ TAG MATCHING
     words = [w for w in re.findall(r"\w+", question.lower()) if w not in STOPWORDS and len(w) > 2]
     found_tag = False
-
     for word in words:
-        for term, (key, val) in TAG_MAP.items():
-            if word == term:
-                params["tag_key"], params["tag_value"] = key, val
-                found_tag = True
-                break
-        if found_tag:
+        if word in TAG_MAP:
+            params["tag_key"], params["tag_value"] = TAG_MAP[word]
+            found_tag = True
             break
-
-    # Fuzzy match fallback
     if not found_tag:
         for word in words:
             close = get_close_matches(word, TAG_MAP.keys(), n=1, cutoff=0.8)
@@ -193,24 +226,33 @@ def parse_question(question: str) -> dict:
                 params["tag_key"], params["tag_value"] = key, val
                 break
 
-    # If we found a tag, set default location logic
-    for ent in doc.ents:
-        if ent.label_ in {"GPE", "LOC"}:
-            try:
-                params["bbox"] = geocode_location(ent.text)
-                params["place_name"] = ent.text
-                params["mode"] = "bbox"  # Will default to bbox-based in query builder
-                return params
-            except ValueError:
-                continue
+    # If a tag was found, try to infer location from question
+    if params.get("tag_key"):
+        for ent in doc.ents:
+            if ent.label_ in {"GPE", "LOC"}:
+                try:
+                    params.update({
+                        "bbox": geocode_location(clean_name(ent.text)),
+                        "place_name": ent.text,
+                        "mode": "bbox"
+                    })
+                    return params
+                except Exception:
+                    continue
 
-    # If we have tag but no bbox, try center
-    if params.get("tag_key") and not params.get("mode"):
-        params.update({
-            "center": geocode_point("Berlin"),
-            "radius": 1000,
-            "mode": "generic"
-        })
+        # fallback to center-based search if no bbox
+        for ent in doc.ents:
+            if ent.label_ in {"GPE", "LOC"}:
+                try:
+                    params.update({
+                        "center": geocode_point(clean_name(ent.text)),
+                        "radius": 1000,
+                        "place_name": ent.text,
+                        "mode": "generic"
+                    })
+                    return params
+                except Exception:
+                    continue
 
     return params
 
@@ -304,7 +346,8 @@ out center;"""
 );
 out center;"""
         else:
-            raise ValueError("No area specified.")
+            raise ValueError("No location (bbox or center) could be resolved from the question.")
+
 
 
 if __name__ == "__main__":
@@ -317,11 +360,11 @@ if __name__ == "__main__":
     if input_arg.lower() == "examples":
         examples = [
             # 🔍 Proximity / Discovery
-            "What is around me right now?",  # generic, radius from current location
-            "Are there any vegan restaurants near me?",  # tag + diet
-            "What are the closest ATMs near Brandenburg Gate?",  # amenity=atm, location-based
+            "What is near Aula Magna right now?",  # generic, radius from current location
+            "Are there any vegan restaurants near Aula Magna?",  # tag + diet
+            "What are the closest ATMs near Musée universitaire de Louvain?",  # amenity=atm, location-based
             "Which beaches near Lisbon are wheelchair accessible?",  # natural=beach + wheelchair
-            "Are there baby changing stations in JFK Terminal 4?",  # baby_changing=yes + location
+            "Are there baby changing stations in Musée universitaire de Louvain?",  # baby_changing=yes + location
             "Show me cafes within 2 km of Amsterdam Central Station",  # radius + tag
             "Find restaurants in Berlin",  # bbox + tag
             "Look for places near Eiffel Tower",  # generic
