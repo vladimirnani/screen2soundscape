@@ -1,4 +1,5 @@
 # run_assistant.py
+# run_assistant.py
 import warnings
 import transformers
 warnings.filterwarnings("ignore")
@@ -12,6 +13,7 @@ import argparse
 import os
 import json
 from langdetect import detect
+from deep_translator import GoogleTranslator
 from utils.transcribe import record_and_transcribe
 from utils.speak import speak
 from utils.question_to_overpass import (
@@ -102,20 +104,35 @@ def main(speaker, language, speed, save_json, text, text_file):
     t9 = time.time()
     summary = summarize_results(question, results)
     t10 = time.time()
-    print("✅ Summary:")
+    print("✅ Summary (English):")
     print(summary)
     print(f"⏱️ Step 5 duration: {t10 - t9:.2f} seconds\n")
+
+    # Step 5.5: Translate summary if needed
+    lang_code = lang.lower()
+    translated_summary = summary
+
+    if lang_code not in ["en", "en_us", "en_newest"]:
+        try:
+            print(f"🌍 Detected non-English language '{lang}'. Translating summary...")
+            translated_summary = GoogleTranslator(source="en", target=lang_code).translate(summary)
+            print(f"✅ Translated summary ({lang_code}):")
+            print(translated_summary)
+        except Exception as e:
+            print(f"⚠️ Failed to translate summary to '{lang_code}': {e}")
+            translated_summary = summary  # fallback to English
 
     # Step 6: Speak summary
     print("🕒 Step 6: Speaking response with TTS...")
     t11 = time.time()
-    speak(summary, language=language or lang.upper(), speaker_key=speaker, speed=speed)
+    speak(translated_summary, language=language or lang.upper(), speaker_key=speaker, speed=speed)
     t12 = time.time()
     print(f"✅ Finished speaking.")
     print(f"⏱️ Step 6 duration: {t12 - t11:.2f} seconds\n")
 
     total_time = t12 - t1
     print(f"🎉 Assistant process completed in {total_time:.2f} seconds.")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the OSM voice assistant.")
