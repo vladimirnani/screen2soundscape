@@ -9,388 +9,371 @@ import os
 from langdetect import detect
 from deep_translator import GoogleTranslator
 import string
+from geoparser import Geoparser
+# Llama fallback
+from llama_cpp import Llama
+import contextlib, io
 
+# Initialize geoparser and spaCy
+geoparser = Geoparser()
 nlp = spacy.load("en_core_web_sm")
 
-STOPWORDS = {"is", "a", "an", "the", "in", "on", "at", "of", "to", "from", "with", "for", "near", "by"}
-
-
-def clean_name(name):
-    return name.strip().strip(string.punctuation)
-
-
-def detect_and_translate(question: str) -> str:
-    lang = detect(question)
-    if lang == "fr":
-        try:
-            translated = GoogleTranslator(source="fr", target="en").translate(question)
-            print(f"🌍 Translated from French: '{question}' → '{translated}'")
-            return translated
-        except Exception as e:
-            print(f"⚠️ Translation failed: {e}")
-    return question
-
-
-def load_text(source: str) -> list[str]:
-    if os.path.isfile(source):
-        with open(source, "r", encoding="utf-8") as f:
-            return [line.strip() for line in f if line.strip()]
-    else:
-        return [source]
-
-# Load OSM tag map from JSON
+# Load OSM tag map (optional) and full OSM keys for fallback
+TAG_VALUES_PATH = "../osm_tags/all_osm_tags.json"
 TAG_MAP = {}
-def load_tag_map(path):
-    global TAG_MAP
-    with open(path, "r", encoding="utf-8") as f:
-        raw = json.load(f)
-    for entry in raw.get("data", []):
-        key = entry["key"]
-        TAG_MAP[key] = (key, key)
+if os.path.isfile(TAG_VALUES_PATH):
+    try:
+        with open(TAG_VALUES_PATH, "r", encoding="utf-8") as f:
+            tag_values = json.load(f)
+        # tag_values is dict: key -> list of values
+        for key, values in tag_values.items():
+            for val in values:
+                TAG_MAP[val] = (key, val)
+    except Exception as e:
+        print(f"⚠️ Could not load tag values cache: {e}")
+else:
+    print(f"⚠️ all_osm_tags.json not found at {TAG_VALUES_PATH}")
 
-# Geocoding utilities
-def geocode_point(location: str):
-    geolocator = Nominatim(user_agent="nl_overpass_converter", timeout=5)
-    place = geolocator.geocode(location, exactly_one=True)
+STOPWORDS = {"is","a","an","the","in","on","at","of","to","from","with","for","near","by"}
+DEFAULT_RADIUS = 1000
+
+def load_text(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return [line.strip() for line in f if line.strip()]
+
+def clean_name(n):
+    return n.strip().strip(string.punctuation)
+
+def detect_and_translate(q):
+    if detect(q) == "fr":
+        try:
+            t = GoogleTranslator(source="fr", target="en").translate(q)
+            print(f"🌍 {q!r} → {t!r}")
+            return t
+        except:
+            return q
+    return q
+
+def geocode_point(loc):
+    geo = Nominatim(user_agent="osmv", timeout=5)
+    place = geo.geocode(loc, exactly_one=True)
     if not place:
-        raise ValueError(f"Could not geocode location: {location}")
+        raise ValueError(f"Could not geocode: {loc}")
     return place.latitude, place.longitude
 
-def geocode_location(location: str):
-    geolocator = Nominatim(user_agent="nl_overpass_converter", timeout=5)
-    place = geolocator.geocode(location, exactly_one=True)
+def geocode_bbox(loc):
+    geo = Nominatim(user_agent="osmv", timeout=5)
+    place = geo.geocode(loc, exactly_one=True)
     if not place:
-        raise ValueError(f"Could not geocode location: {location}")
+        raise ValueError(f"Could not geocode: {loc}")
     south, north, west, east = map(float, place.raw["boundingbox"])
     return south, west, north, east
 
+def extract_location(q, doc):
+    tried = set()
+    def try_geo(candidate, source):
+        cand = clean_name(candidate)
+        if cand in tried:
+            return None, None
+        tried.add(cand)
+        try:
+            _ = geocode_point(cand)
+            return cand, source
+        except:
+            return None, None
 
-def parse_question(question: str) -> dict:
-    question = detect_and_translate(question)
-    doc = nlp(question.lower())
-    params = {
+    # Named entities
+    for ent in doc.ents:
+        if ent.label_ in {"GPE", "LOC", "FAC", "ORG"}:
+            res, source = try_geo(ent.text, "spaCy NER")
+            if res:
+                return res, source
+
+    # Preposition tail
+    m = re.search(r"(?:in|near|around|by)\s+(.+)", q, re.IGNORECASE)
+    if m:
+        res, source = try_geo(m.group(1), "preposition regex")
+        if res:
+            return res, source
+
+    # Noun chunks
+    for chunk in doc.noun_chunks:
+        if any(tok.pos_ == "PROPN" for tok in chunk):
+            res, source = try_geo(chunk.text, "noun chunk")
+            if res:
+                return res, source
+
+    return None, None
+
+
+# Prepare Llama model silently
+with contextlib.redirect_stdout(io.StringIO()):
+    llm = Llama(model_path=r"./models/llama-2-7b-chat.Q4_K_M.gguf",
+            n_ctx=2048, n_threads=8, verbose=False)
+
+
+def extract_locations_llama(text):
+    prompt = (
+        "Extract the names of specific places or locations mentioned in the sentence.\n\n"
+        "Input: I want to find good sushi near Times Square.\nOutput: Times Square\n\n"
+        "Input: Are there any vegan restaurants near Aula Magna?\nOutput: Aula Magna\n\n"
+        "Input: Show me hostels near downtown Prague.\nOutput: downtown Prague\n\n"
+        f"Input: {text}\nOutput:"
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        resp = llm(prompt, max_tokens=32, echo=False)
+    return resp["choices"][0]["text"].strip()
+
+
+def parse_question(raw_q):
+    q = detect_and_translate(raw_q)
+    doc = nlp(q)
+    P = {
         "tag_key": None, "tag_value": None,
-        "bbox": None, "radius": None, "center": None,
-        "mode": None, "place_name": None,
-        "start": None, "end": None, "poi": None,
-        "start_coords": None, "end_coords": None, "poi_coords": None,
-        "transport": "walk", "wheelchair_only": False
+        "mode": None, "center": None, "bbox": None, "radius": None,
+        "wheelchair_only": False, "pet_friendly": False,
+        "opening_hours_regex": None,
+        "start_coords": None, "end_coords": None, "poi_coords": None
     }
-
-    # 🚦 ROUTING LOGIC
-    m = re.search(r"(walk|drive|bike|bus|train)?\s*from\s+(.+?)\s+to\s+(.+?)(?:\s+(?:past|via)\s+(?:an|a)?\s*(.+))?$", question, re.IGNORECASE)
-    if m:
-        mode, start, end, poi = m.groups()
-        params.update({
-            "start": start.strip(), "end": end.strip(),
-            "poi": poi.strip() if poi else None,
-            "mode": "route_via" if poi else "route_check",
-            "transport": mode.lower() if mode else "walk"
-        })
+    # Early location extraction
+    loc, source = extract_location(q, doc)
+    if loc:
         try:
-            params["start_coords"] = geocode_point(params["start"])
-            params["end_coords"] = geocode_point(params["end"])
-            if params["poi"]:
-                params["poi_coords"] = geocode_point(params["poi"])
-        except ValueError as e:
-            print(f"❌ Geocoding error: {e}")
-        return params
-
-    # ♿ GENERAL WHEELCHAIR ACCESSIBILITY QUERY
-    if "wheelchair accessible" in question:
-        place_type = None
-        for word in re.findall(r"\w+", question.lower()):
-            if word in STOPWORDS or len(word) < 3:
-                continue
-            if word in TAG_MAP:
-                place_type = TAG_MAP[word]
-                break
-            close = get_close_matches(word, TAG_MAP.keys(), n=1, cutoff=0.8)
-            if close:
-                place_type = TAG_MAP[close[0]]
-                print(f"🤖 Interpreted '{word}' as '{close[0]}'")
-                break
-
-        for ent in doc.ents:
-            if ent.label_ in {"GPE", "LOC"}:
-                try:
-                    center = geocode_point(clean_name(ent.text))
-                    if place_type:
-                        key, val = place_type
-                        params.update({
-                            "tag_key": key,
-                            "tag_value": val,
-                            "wheelchair_only": True,
-                            "center": center,
-                            "radius": 1000,
-                            "mode": "generic",
-                            "place_name": ent.text
-                        })
-                        return params
-                except Exception as e:
-                    print(f"❌ Geocoding error for location: {e}")
-
-    # ♿ CHECK IF A NAMED PLACE IS WHEELCHAIR ACCESSIBLE
-    m = re.search(r"is\s+(.+?)\s+wheelchair\s+accessible", question, re.IGNORECASE)
-    if m:
-        location = clean_name(m.group(1).strip())
-        try:
-            center = geocode_point(location)
-            params.update({
-                "center": center,
-                "place_name": location,
-                "tag_key": "wheelchair",
-                "tag_value": "yes",
-                "radius": 500,
-                "mode": "generic"
-            })
+            P["center"] = geocode_point(loc)
+            P["place_name"] = loc
+            P["loc_source"] = source
+            print(f"📍 Location “{loc}” detected via {source} → geocoded with Nominatim")
         except Exception as e:
-            print(f"❌ Geocoding error: {e}")
-        return params
+            print(f"⚠️ Failed geocoding extracted location {loc}: {e}")
 
-    # 🚻 NEAREST TOILET
-    if re.search(r"(?:nearest|closest)\s+toilet", question, re.IGNORECASE):
-        for ent in doc.ents:
-            if ent.label_ in {"GPE", "LOC"}:
-                try:
-                    center = geocode_point(clean_name(ent.text))
-                    params.update({
-                        "tag_key": "amenity", "tag_value": "toilets",
-                        "radius": 1000,
-                        "mode": "generic",
-                        "center": center,
-                        "place_name": ent.text
-                    })
-                    return params
-                except Exception as e:
-                    print(f"❌ Geocoding error for location in toilet query: {e}")
 
-    # 📍 WITHIN X KM OF LOCATION
-    m = re.search(r"within\s+(\d+)\s*km\s+of\s+(.+)", question, re.IGNORECASE)
+    # Route queries
+    m = re.search(
+        r"\b(walk|drive|bike|bus|train)\b.*?from\s+(.+?)\s+to\s+(.+?)(?:\s+(?:past|via)\s+(.+))?$",
+        q, re.IGNORECASE)
     if m:
-        radius_km, loc = m.groups()
+        mode, start, end, via = m.groups()
+
+        # Heuristic cleaning: remove trailing fluff like "along the river"
+        def clean_route_endpoint(text):
+            text = clean_name(text)
+            # Remove common trailing descriptors
+            text = re.sub(r"\s+(along|via|past|through|near|by)\b.*", "", text)
+            return text
+
         try:
-            params.update({
-                "radius": int(radius_km) * 1000,
-                "center": geocode_point(clean_name(loc)),
-                "mode": "generic"
+            start_clean = clean_route_endpoint(start)
+            end_clean = clean_route_endpoint(end)
+            P.update({
+                "start_coords": geocode_point(start_clean),
+                "end_coords": geocode_point(end_clean),
+                "mode": "route_via" if via else "route_check"
             })
-        except ValueError:
-            pass
-        return params
+            print(f"📍 Route start: {start_clean} → {P['start_coords']}")
+            print(f"📍 Route end: {end_clean} → {P['end_coords']}")
+            if via:
+                via_clean = clean_route_endpoint(via)
+                P["poi_coords"] = geocode_point(via_clean)
+                print(f"📍 Route via: {via_clean} → {P['poi_coords']}")
+            return P
+        except Exception as e:
+            print(f"⚠️ Failed geocoding route components: {e}")
 
-    # 🗺️ WHERE IS LOCATION
-    if re.match(r"where\s+is\s+(.+)", question, re.IGNORECASE):
-        for ent in doc.ents:
-            if ent.label_ in {"GPE", "LOC"}:
-                params.update({
-                    "mode": "boundary_lookup",
-                    "place_name": clean_name(ent.text.title())
-                })
-                return params
-        m = re.match(r"where\s+is\s+(.+)", question, re.IGNORECASE)
-        if m:
-            params.update({
-                "mode": "boundary_lookup",
-                "place_name": clean_name(m.group(1).title())
-            })
-            return params
 
-    # 🔍 PLACES NEAR X
-    m = re.search(r"places\s+near\s+(.+)", question, re.IGNORECASE)
+    # Pet-friendly hotels
+    if re.search(r"pet[- ]friendly", q, re.IGNORECASE) and P.get("center"):
+        P.update({
+            "tag_key": "tourism", "tag_value": "hotel",
+            "pet_friendly": True,
+            "mode": "generic", "radius": DEFAULT_RADIUS
+        })
+        return P
+
+    # Opening-hours queries
+    m = re.search(r"open(?:ing)? past (\d+)(am|pm)?", q, re.IGNORECASE)
+    if m and P.get("center"):
+        hour = int(m.group(1))
+        if m.group(2) and m.group(2).lower() == "pm" and hour < 12:
+            hour += 12
+        P["opening_hours_regex"] = f"{hour:02d}:"
+        if re.search(r"librar", q, re.IGNORECASE):
+            P.update({"tag_key": "amenity", "tag_value": "library"})
+        if P.get("tag_key"):
+            P.update({"mode": "generic", "radius": DEFAULT_RADIUS})
+            return P
+
+    # Baby-changing stations
+    if re.search(r"baby chang(?:ing)? stations?", q, re.IGNORECASE) and P.get("center"):
+        P.update({
+            "tag_key": "baby_changing", "tag_value": "yes",
+            "mode": "generic", "radius": DEFAULT_RADIUS
+        })
+        return P
+
+    # Nearest/closest POIs
+    m = re.search(r"\b(?:nearest|closest)\s+(\w+)\b", q, re.IGNORECASE)
+    if m and P.get("center"):
+        poi = m.group(1).lower().rstrip("s")
+        P.update({"tag_key": "amenity", "tag_value": poi, "mode": "generic", "radius": DEFAULT_RADIUS})
+        return P
+
+    # Within X km of Y
+    m = re.search(r"within\s+(\d+)\s*km\s+of\s+(.+)", q, re.IGNORECASE)
     if m:
+        dist, place = m.groups()
         try:
-            params.update({
-                "center": geocode_point(clean_name(m.group(1).strip())),
-                "radius": 500,
-                "mode": "generic"
-            })
-            return params
-        except ValueError:
+            P["center"] = geocode_point(clean_name(place))
+            P.update({"radius": int(dist) * 1000, "mode": "generic"})
+            return P
+        except:
             pass
 
-    # 🏷️ TAG MATCHING
-    words = [w for w in re.findall(r"\w+", question.lower()) if w not in STOPWORDS and len(w) > 2]
-    found_tag = False
-    for word in words:
-        if word in TAG_MAP:
-            params["tag_key"], params["tag_value"] = TAG_MAP[word]
-            found_tag = True
+    # Boundary lookup (where is X)
+    m = re.match(r"where\s+is\s+(.+)", q, re.IGNORECASE)
+    if m:
+        P.update({"mode": "boundary_lookup", "place_name": clean_name(m.group(1).title())})
+        return P
+
+    # Places near X
+    m = re.search(r"places\s+near\s+(.+)", q, re.IGNORECASE)
+    if m:
+        place_near = clean_name(m.group(1))
+        try:
+            P['center'] = geocode_point(place_near)
+            P.update({"mode": "generic", "radius": DEFAULT_RADIUS})
+            P["place_name"] = place_near
+            return P
+        except:
+            pass
+
+    # Tag detection using full TAG_MAP
+    found = False
+    for key in sorted(TAG_MAP, key=lambda k: -len(k)):
+        phrase = key.replace("_", " ")
+        if phrase in q.lower():
+            P['tag_key'], P['tag_value'] = TAG_MAP[key]
+            found = True
             break
-    if not found_tag:
-        for word in words:
-            close = get_close_matches(word, TAG_MAP.keys(), n=1, cutoff=0.8)
-            if close:
-                key, val = TAG_MAP[close[0]]
-                print(f"🤖 Interpreted '{word}' as '{close[0]}'")
-                params["tag_key"], params["tag_value"] = key, val
-                break
+    if found and P.get("center"):
+        if re.search(r"\bin\b", q, re.IGNORECASE) and not re.search(r"\bnear\b", q, re.IGNORECASE):
+            try:
+                P['bbox'] = geocode_bbox(P['place_name'])
+            except:
+                pass
+        P.update({"mode": "generic", "radius": DEFAULT_RADIUS})
+        return P
 
-    # If a tag was found, try to infer location from question
-    if params.get("tag_key"):
-        for ent in doc.ents:
-            if ent.label_ in {"GPE", "LOC"}:
-                try:
-                    params.update({
-                        "bbox": geocode_location(clean_name(ent.text)),
-                        "place_name": ent.text,
-                        "mode": "bbox"
-                    })
-                    return params
-                except Exception:
-                    continue
-
-        # fallback to center-based search if no bbox
-        for ent in doc.ents:
-            if ent.label_ in {"GPE", "LOC"}:
-                try:
-                    params.update({
-                        "center": geocode_point(clean_name(ent.text)),
-                        "radius": 1000,
-                        "place_name": ent.text,
-                        "mode": "generic"
-                    })
-                    return params
-                except Exception:
-                    continue
-
-    return params
+    # Llama fallback for location extraction
+    if not P.get("center"):
+        try:
+            fallback_loc = extract_locations_llama(raw_q)
+            try:
+                P['center'] = geocode_point(fallback_loc)
+            except:
+                # Retry with "in [city]" variants or append common type
+                retry_phrases = [
+                    f"{fallback_loc} building", f"{fallback_loc} museum", f"{fallback_loc} location"
+                ]
+                for phrase in retry_phrases:
+                    try:
+                        P['center'] = geocode_point(phrase)
+                        fallback_loc = phrase
+                        print(f"📍 Retried LLaMA location as “{phrase}” → geocoded successfully")
+                        break
+                    except:
+                        continue
+            if P.get("center"):
+                P['place_name'] = fallback_loc
+                P["loc_source"] = "LLaMA fallback"
+                P.update({"mode": "generic", "radius": DEFAULT_RADIUS})
+                print(f"📍 Location “{fallback_loc}” extracted via LLaMA fallback → geocoded with Nominatim")
+        except Exception as e:
+            print(f"⚠️ LLaMA fallback failed: {e}")
 
 
-def build_overpass_query(params: dict) -> str:
-    mode = params.get("mode")
+    # Final generic fallback
+    if P.get("center") and not P.get("mode"):
+        P.update({"mode": "generic", "radius": DEFAULT_RADIUS})
+    return P
 
-    if mode == "geocode":
-        lat, lon = params["center"]
-        return f"📍 {params.get('place_name', 'Location')} is at latitude {lat:.5f}, longitude {lon:.5f}."
 
-    elif mode == "boundary_lookup":
-        name = params.get("place_name", "Unknown")
-        return f"""[out:json][timeout:25];
-relation
-  ["boundary"="administrative"]
-  ["name"="{name}"]
-  ["admin_level"~"^(8|6|4)$"];
-out body;
->;
-out skel qt;"""
+def build_overpass_query(P):
+    tag_f = f'["{P.get("tag_key")}"="{P.get("tag_value")}"]' if P.get("tag_key") else ""
+    wh_f = '["wheelchair"="yes"]' if P.get("wheelchair_only") else ""
+    pet_f = '["pets"="yes"]' if P.get("pet_friendly") else ""
+    open_f = f'["opening_hours"~"{P.get("opening_hours_regex")}"]' if P.get("opening_hours_regex") else ""
 
-    elif mode == "generic":
-        lat, lon = params["center"]
-        r = params["radius"]
-        tag_filter = f'["{params["tag_key"]}"="{params["tag_value"]}"]' if params.get("tag_key") else ""
-        wheelchair_filter = '["wheelchair"="yes"]' if params.get("wheelchair_only") else ""
+    if P.get("mode") == "boundary_lookup":
+        name = P["place_name"]
+        return (
+            f'[out:json][timeout:25];relation["boundary"="administrative"]["name"="{name}"]'
+            '["admin_level"~"^(8|6|4)$"];out body;>;out skel qt;'
+        )
 
-        return f"""[out:json][timeout:25];
-(
-  node{tag_filter}{wheelchair_filter}(around:{r},{lat},{lon});
-  way{tag_filter}{wheelchair_filter}(around:{r},{lat},{lon});
-  rel{tag_filter}{wheelchair_filter}(around:{r},{lat},{lon});
-);
-out center;"""
+    if P.get("mode") == "generic":
+        if P.get("bbox"):
+            s, w2, n2, e = P["bbox"]
+            area = f"({s},{w2},{n2},{e})"
+        else:
+            lat, lon = P["center"]
+            area = f"(around:{P['radius']},{lat},{lon})"
+        return (
+            "[out:json][timeout:25];(\n"
+            f"  node{tag_f}{wh_f}{pet_f}{open_f}{area};\n"
+            f"  way{tag_f}{wh_f}{pet_f}{open_f}{area};\n"
+            f"  rel{tag_f}{wh_f}{pet_f}{open_f}{area};\n"
+            ");out center;"
+        )
 
-    elif mode == "route_check":
-        lat1, lon1 = params["start_coords"]
-        lat2, lon2 = params["end_coords"]
+    if P.get("mode") in ("route_check", "route_via"):
+        s_coords, e_coords = P["start_coords"], P["end_coords"]
+        lat1, lon1 = s_coords
+        lat2, lon2 = e_coords
         south = min(lat1, lat2) - 0.01
         north = max(lat1, lat2) + 0.01
         west = min(lon1, lon2) - 0.01
         east = max(lon1, lon2) + 0.01
+        return (
+            "[out:json][timeout:25];(\n"
+            f"  way[\"leisure\"=\"park\"]({south},{west},{north},{east});\n"
+            f"  rel[\"leisure\"=\"park\"]({south},{west},{north},{east});\n"
+            ");out center;"
+        )
 
-        return f"""[out:json][timeout:25];
-(
-  way["leisure"="park"]({south},{west},{north},{east});
-  relation["leisure"="park"]({south},{west},{north},{east});
-);
-out center;"""
+    raise ValueError("No location (bbox or center) could be resolved.")
 
-    elif mode == "route_via":
-        lat1, lon1 = params["start_coords"]
-        lat2, lon2 = params["end_coords"]
-        lat3, lon3 = params["poi_coords"]
-        south = min(lat1, lat2, lat3) - 0.01
-        north = max(lat1, lat2, lat3) + 0.01
-        west = min(lon1, lon2, lon3) - 0.01
-        east = max(lon1, lon2, lon3) + 0.01
-        poi_name = params["poi"].lower()
-
-        return f"""[out:json][timeout:25];
-(
-  node["name"~"{poi_name}", i]({south},{west},{north},{east});
-  way["name"~"{poi_name}", i]({south},{west},{north},{east});
-  relation["name"~"{poi_name}", i]({south},{west},{north},{east});
-);
-out center;"""
-
-    else:
-        key, value = params.get("tag_key"), params.get("tag_value")
-        tag_filter = f'[{key}="{value}"]' if key and value else ""
-
-        if params.get("bbox"):
-            south, west, north, east = params["bbox"]
-            return f"""[out:json][timeout:25];
-(
-  node{tag_filter}({south},{west},{north},{east});
-  way{tag_filter}({south},{west},{north},{east});
-  rel{tag_filter}({south},{west},{north},{east});
-);
-out center;"""
-        elif params.get("center"):
-            lat, lon = params["center"]
-            r = params.get("radius", 500)
-            return f"""[out:json][timeout:25];
-(
-  node{tag_filter}(around:{r},{lat},{lon});
-  way{tag_filter}(around:{r},{lat},{lon});
-  rel{tag_filter}(around:{r},{lat},{lon});
-);
-out center;"""
-        else:
-            raise ValueError("No location (bbox or center) could be resolved from the question.")
-
-
-
+# Command-line interface
 if __name__ == "__main__":
     input_arg = sys.argv[1] if len(sys.argv) > 1 else "examples"
-
     output_lines = []
     save_to_file = False
     output_filename = None
 
     if input_arg.lower() == "examples":
         examples = [
-            # 🔍 Proximity / Discovery
-            "What is near Aula Magna right now?",  # generic, radius from current location
-            "Are there any vegan restaurants near Aula Magna?",  # tag + diet
-            "What are the closest ATMs near Musée universitaire de Louvain?",  # amenity=atm, location-based
-            "Which beaches near Lisbon are wheelchair accessible?",  # natural=beach + wheelchair
-            "Are there baby changing stations in Musée universitaire de Louvain?",  # baby_changing=yes + location
-            "Show me cafes within 2 km of Amsterdam Central Station",  # radius + tag
-            "Find restaurants in Berlin",  # bbox + tag
-            "Look for places near Eiffel Tower",  # generic
-
-            # 📍 Location lookup
-            "Where is Lyon?",  # boundary lookup
-            "Is MOMA wheelchair accessible?",  # specific tag query on a named place
-
-            # 🎭 Thematic queries
-            "What historical sites are near the Colosseum?",  # historic tag + nearby
-            "Show me UNESCO World Heritage sites in India.",  # heritage=unesco + bbox
-            "Where can I find live jazz bars in New Orleans?",  # amenity=bar + music:genre=jazz
-            "What’s a good area for street food in Bangkok?",  # cuisine=street_food
-            "Where can I find hostels near downtown Prague?",  # tourism=hostel
-            "Are there pet-friendly hotels in Zurich?",  # tourism=hotel + pets=yes
-            "Show me all libraries open past 8 PM in central London.",  # amenity=library + opening_hours
-
-            # 🧭 Route-based (handled but not with Overpass directly)
+            "What is near Aula Magna right now?",
+            "Are there any vegan restaurants near Aula Magna?",
+            "What are the closest ATMs near Musée universitaire de Louvain?",
+            "Which beaches near Lisbon are wheelchair accessible?",
+            "Are there baby changing stations in Musée universitaire de Louvain?",
+            "Show me cafes within 2 km of Amsterdam Central Station",
+            "Find restaurants in Berlin",
+            "Look for places near Eiffel Tower",
+            "Where is Lyon?",
+            "Is MOMA wheelchair accessible?",
+            "What historical sites are near the Colosseum?",
+            "Show me UNESCO World Heritage sites in India.",
+            "Where can I find live jazz bars in New Orleans?",
+            "What’s a good area for street food in Bangkok?",
+            "Where can I find hostels near downtown Prague?",
+            "Are there pet-friendly hotels in Zurich?",
+            "Show me all libraries open past 8 PM in central London.",
             "Can I drive from Marseille to Nice via Avignon?",
             "Puis-je conduire de Marseille à Nice via Avignon ?",
             "How can I bike from Stanford University to Googleplex?",
             "What's the fastest public transport route from Heathrow to Covent Garden?",
             "Can I walk from the Louvre to Notre-Dame along the river?",
-            "How long does it take to drive from Barcelona to Valencia?"
         ]
-
     elif os.path.isfile(input_arg):
         examples = load_text(input_arg)
         save_to_file = True
@@ -410,11 +393,8 @@ if __name__ == "__main__":
             print(result)
             if save_to_file:
                 output_lines.append(f"# {ex}\n{result}\n")
-        except ValueError as e:
+        except Exception as e:
             print("❌", e)
-            if save_to_file:
-                output_lines.append(f"# {ex}\n# ❌ {e}\n")
-
         print()
 
     if save_to_file and output_filename:
