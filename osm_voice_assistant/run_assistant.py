@@ -1,5 +1,4 @@
 # run_assistant.py
-# run_assistant.py
 import warnings
 import transformers
 warnings.filterwarnings("ignore")
