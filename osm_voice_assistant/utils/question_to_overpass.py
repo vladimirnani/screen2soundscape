@@ -1,4 +1,3 @@
-# question_to_overpass.py
 import re
 import spacy
 import json
@@ -10,8 +9,9 @@ from langdetect import detect
 from deep_translator import GoogleTranslator
 import string
 from geoparser import Geoparser
-# Llama fallback
-from llama_cpp import Llama
+from utils.llama_singleton import get_llm
+llm = get_llm()
+
 import contextlib, io
 
 # Initialize geoparser and spaCy
@@ -19,7 +19,9 @@ geoparser = Geoparser()
 nlp = spacy.load("en_core_web_sm")
 
 # Load OSM tag map (optional) and full OSM keys for fallback
-TAG_VALUES_PATH = "../osm_tags/all_osm_tags.json"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TAG_VALUES_PATH = os.path.join(BASE_DIR, "..", "osm_tags", "all_osm_tags.json")
+
 TAG_MAP = {}
 if os.path.isfile(TAG_VALUES_PATH):
     try:
@@ -104,12 +106,6 @@ def extract_location(q, doc):
                 return res, source
 
     return None, None
-
-
-# Prepare Llama model silently
-with contextlib.redirect_stdout(io.StringIO()):
-    llm = Llama(model_path=r"./models/llama-2-7b-chat.Q4_K_M.gguf",
-            n_ctx=2048, n_threads=8, verbose=False)
 
 
 def extract_locations_llama(text):
