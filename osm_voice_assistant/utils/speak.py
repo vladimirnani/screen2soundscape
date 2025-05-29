@@ -1,28 +1,52 @@
+# speak.py
+import warnings
+import transformers
+warnings.filterwarnings("ignore")
+transformers.logging.set_verbosity_error()
+
+import torch
+torch._C._jit_set_profiling_mode(False)
+torch._C._jit_set_profiling_executor(False)
+
 import os
 import re
 import glob
-import torch
 import argparse
 import datetime
 from openvoice.api import ToneColorConverter
 from melo.api import TTS
 
-import warnings
-warnings.filterwarnings("ignore", category=UserWarning, module="openvoice")
+# Base path: project root
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-CONVERTER_CKPT_DIR = "../checkpoints_v2/converter"
-BASE_SE_DIR = "../checkpoints_v2/base_speakers/ses"
-VOICES_DIR = "openvoice_voices"
-DEFAULT_OUTPUT_DIR = "osm_assistant_speaker_audio"
+CONVERTER_CKPT_DIR = os.path.join(BASE_DIR, "checkpoints_v2", "converter")
+BASE_SE_DIR = os.path.join(BASE_DIR, "checkpoints_v2", "base_speakers", "ses")
+VOICES_DIR = os.path.join(BASE_DIR, "openvoice_voices")
+DEFAULT_OUTPUT_DIR = os.path.join(BASE_DIR, "osm_assistant_speaker_audio")
 
 device = "cuda:0" if torch.cuda.is_available() else "cpu"
-tone_color_converter = ToneColorConverter(
-    os.path.join(CONVERTER_CKPT_DIR, "config.json"),
-    device=device
-)
-tone_color_converter.load_ckpt(
-    os.path.join(CONVERTER_CKPT_DIR, "checkpoint.pth")
-)
+
+# Load TTS and converter once
+_tone_color_converter = None
+_tts_models = {}
+
+def get_tone_color_converter():
+    global _tone_color_converter
+    if _tone_color_converter is None:
+        _tone_color_converter = ToneColorConverter(
+            os.path.join(CONVERTER_CKPT_DIR, "config.json"),
+            device=device
+        )
+        _tone_color_converter.load_ckpt(
+            os.path.join(CONVERTER_CKPT_DIR, "checkpoint.pth")
+        )
+    return _tone_color_converter
+
+def get_tts_model(language):
+    language = language.upper()
+    if language not in _tts_models:
+        _tts_models[language] = TTS(language=language, device=device)
+    return _tts_models[language]
 
 def speak(text: str, language: str, speaker_key: str, speed: float = 1.0, output_dir: str = DEFAULT_OUTPUT_DIR) -> str:
     os.makedirs(output_dir, exist_ok=True)
@@ -38,7 +62,7 @@ def speak(text: str, language: str, speaker_key: str, speed: float = 1.0, output
     if not matches:
         raise FileNotFoundError(f"❌ No matching audio files found for speaker '{speaker_key}' and language '{language}'.")
     elif len(matches) > 1:
-        print("⚠️ Multiple audio files found with that name, specify the source. For now I will use the full file by default.")
+        print("⚠️ Multiple audio files found with that name, using the first match.")
 
     src_audio_path = matches[0]
 
@@ -50,7 +74,7 @@ def speak(text: str, language: str, speaker_key: str, speed: float = 1.0, output
     target_se = torch.load(se_path, map_location=device)
 
     # Create base TTS audio
-    model = TTS(language=language, device=device)
+    model = get_tts_model(language)
     speaker_ids = model.hps.data.spk2id
     if language.replace("_", "-") not in [k.upper().replace("_", "-") for k in speaker_ids.keys()]:
         raise ValueError(f"❌ No TTS model available for language '{language}'.")
@@ -62,7 +86,8 @@ def speak(text: str, language: str, speaker_key: str, speed: float = 1.0, output
     # Convert using voice cloning
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     out_path = os.path.join(output_dir, f"tts_{timestamp}.wav")
-    tone_color_converter.convert(
+    converter = get_tone_color_converter()
+    converter.convert(
         audio_src_path=tmp_wav,
         src_se=target_se,
         tgt_se=target_se,
@@ -77,7 +102,6 @@ def speak(text: str, language: str, speaker_key: str, speed: float = 1.0, output
 
     print(f"[speak] ✅ Saved cloned TTS to '{out_path}'")
     return out_path
-
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description="Generate cloned speech from text using OpenVoice + Melo TTS.")
