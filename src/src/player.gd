@@ -1,6 +1,7 @@
 extends CharacterBody3D
 
 # How fast the player moves in meters per second.
+#@export var speed = 50
 @export var speed = 14
 # The downward acceleration when in the air, in meters per second squared.
 @export var fall_acceleration = 75
@@ -13,18 +14,26 @@ var target_velocity = Vector3.ZERO
 @onready var target := $"../Target"
 @onready var target2 := $"../RainTarget"
 @onready var currentTarget := target
+@onready var sliding_audio := $sliding_audio
+@onready var wall_audio := $wall_audio
+@onready var zero_velocity_timer := $zero_velocity_timer
+@onready var rotate_audio := $rotate_audio
 
 var min_distance: float = 5.0  # Closest distance (highest pitch)
 var max_distance: float = 300.0 # Farthest distance (lowest pitch)
 var base_pitch: float   = 1.0     # Default pitch at mid-range
 var min_pitch: float    = 0.5      # Lowest pitch
 var max_pitch: float    = 2.0      # Highest pitch
+var pitch_range: float = 0.5  # How much the pitch can vary
 
 #preload different footstep sounds, still working on it 
 #const footstep_grass = preload("res://sounds/footsteps/footstep_grass.wav")
 #const footstep_concrete = preload("res://sounds/footsteps/footstep_concrete.wav")
 
 var _movement_enabled: bool = true
+var is_sliding: bool = false
+var was_moving: bool = false
+var current_rotation: float = 0.0
 
 func set_movement_enabled(enabled: bool):
 	_movement_enabled = enabled
@@ -38,16 +47,16 @@ func _input(event):
 			elif not event.pressed and event.keycode == KEY_SHIFT:
 				distance_audio.stop()  # Stop when Shift is released
 			if event.pressed and event.keycode == KEY_E:
-				speak('Road on the right.')
+				Speaker.speak('Road on the right.')
 			if event.pressed and event.keycode == KEY_Q:
-				speak('Building on the left.')
+				Speaker.speak('Building on the left.')
 			if event.pressed and event.keycode == KEY_TAB:
 				if currentTarget == target:
 					currentTarget = target2
-					speak('To the Fountain')
+					Speaker.speak('To the Fountain')
 				else:
 					currentTarget = target
-					speak('To the elevator')
+					Speaker.speak('To the elevator')
 
 
 func _process(delta):
@@ -59,33 +68,79 @@ func _process(delta):
 func update_pitch(distance):
 	# Normalize distance to range [0, 1]
 	var normalized = clamp((distance - min_distance) / (max_distance - min_distance), 0, 1)
-
 	# Map distance to pitch range
 	var pitch_value = lerp(max_pitch, min_pitch, normalized)
-
 	# Apply pitch to audio player
 	distance_audio.pitch_scale = pitch_value
 
 
-func speak(text, lang = "en-US"):
-	if OS.has_feature("web"):
-		JavaScriptBridge.eval("""
-			(function() {
-				var msg = new SpeechSynthesisUtterance();
-				msg.text = "%s";
-				msg.lang = "%s";
-				window.speechSynthesis.speak(msg);
-			})();
-		""" % [text, lang])
-	else:
-		DisplayServer.tts_speak(text, "en")
-		
-
-
 func _ready():
-	pass
-	#speak(" Hello ! Walk through the space to find the elevator or the fountain. Hold the shift key to hear the approximate distance. Press Tab to switch target.")
+	var current_place = "the Kerkplein"
+	var to_find = "Cafe Dok 19"
+	#	Speaker.speak(" Hello ! You are at " + current_place + " facing north. Find " + to_find + ". Press shift to hear the proximity sensor to the search place. To move around use W. A. S. D. To turn use left and right arrows. When you hear the name of the place, stop. Hit enter and type word address. Hit enter again to hear the address.", "fr")
 
+	# Load the sliding sound
+	var sliding_sound = load("res://assets/sounds/sliding.mp3")
+	if sliding_sound:
+		sliding_audio.stream = sliding_sound
+		sliding_audio.volume_db = -10  # Adjust volume as needed
+	else:
+		push_error("Could not load sliding.mp3 sound file")
+		
+	# Load the wall hit sound
+	var wall_sound = load("res://assets/audio/boundaries/wall.mp3")
+	if wall_sound:
+		wall_audio.stream = wall_sound
+		wall_audio.volume_db = -10  # Adjust volume as needed
+	else:
+		push_error("Could not load wall.mp3 sound file")
+		
+	# Load the rotation sound
+	var rotate_sound = load("res://assets/audio/rotate.wav")
+	if rotate_sound:
+		rotate_audio.stream = rotate_sound
+		rotate_audio.volume_db = -10  # Adjust volume as needed
+	else:
+		push_error("Could not load rotate.wav sound file")
+		
+	# Connect collision signals
+	print("Connecting collision signals...")
+	connect("body_entered", _on_body_entered)
+	connect("body_exited", _on_body_exited)
+	print("Collision signals connected")
+	
+	# Setup zero velocity timer
+	zero_velocity_timer.one_shot = true
+	zero_velocity_timer.wait_time = 0.2  # Half a second
+	zero_velocity_timer.timeout.connect(_on_zero_velocity_timeout)
+
+func _on_body_entered(body):
+	print("Body entered signal received")
+	print("Body name: ", body.name)
+	print("Body groups: ", body.get_groups())
+	if body.is_in_group("buildings"):
+		is_sliding = true
+		print("Entered building collision")
+		if not sliding_audio.playing and velocity.length() > 0:
+			sliding_audio.play()
+	else:
+		print("Body is not in buildings group")
+
+func _on_body_exited(body):
+	print("Body exited signal received")
+	print("Body name: ", body.name)
+	print("Body groups: ", body.get_groups())
+	if body.is_in_group("buildings"):
+		is_sliding = false
+		print("Exited building collision")
+		sliding_audio.stop()
+	else:
+		print("Body is not in buildings group")
+
+func _on_zero_velocity_timeout():
+	if is_on_wall() and Input.is_action_pressed("move_forward"):
+		if not wall_audio.playing:
+			wall_audio.play()
 
 func _physics_process(delta):
 	if not _movement_enabled:
@@ -104,19 +159,54 @@ func _physics_process(delta):
 	# Moving the Character
 	velocity = target_velocity
 	move_and_slide()
+	
+	# Play sliding sound when touching walls
+	if is_on_wall() and Input.is_action_pressed("move_forward"):
+		print(velocity)
+		if velocity.length() > 0:
+			if not sliding_audio.playing:
+				sliding_audio.play()
+			else:
+				wall_audio.stop()
+				zero_velocity_timer.stop()
+		else:
+			sliding_audio.stop()
+			if not wall_audio.playing and zero_velocity_timer.is_stopped():
+				zero_velocity_timer.start()
+	else:
+		sliding_audio.stop()
+		wall_audio.stop()
+		zero_velocity_timer.stop()
+	
 	footstep(velocity)
-	## Define a turn speed (radians per second)
+	
+	# Handle rotation
 	var turn_speed: float = 3.0
-
-	# Check for turn actions
+	var rotation_amount = 0.0
+	
 	if Input.is_action_pressed("turn_left"):
-		neck.rotate_y(turn_speed * delta)
-		#camera.rotate_x(turn_speed * delta)
+		rotation_amount = turn_speed * delta
+		neck.rotate_y(rotation_amount)
 	elif Input.is_action_pressed("turn_right"):
-		neck.rotate_y(-turn_speed * delta)
-		#camera.rotate_x(-turn_speed * delta)
+		rotation_amount = -turn_speed * delta
+		neck.rotate_y(rotation_amount)
 		
-
+	# Update rotation sound
+	if rotation_amount != 0:
+		neck.rotate_y(rotation_amount)
+		if not rotate_audio.playing:
+			rotate_audio.play()
+		
+		# Calculate pitch based on absolute direction (North = 0, South = 1)
+		# Get the current rotation in radians and normalize it
+		var current_angle = fmod(neck.rotation.y, TAU)  # Keep between 0 and TAU
+		if current_angle < 0:
+			current_angle += TAU  # Make sure it's positive
+		# Map the angle (0 to TAU) to pitch range (1 to 2 and back to 1)
+		rotate_audio.pitch_scale = lerp(1.5, 2.0, sin(current_angle))
+	else:
+		if rotate_audio.playing:
+			rotate_audio.stop()
 
 # footstep sounds
 func footstep(vel):
