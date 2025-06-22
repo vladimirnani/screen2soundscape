@@ -182,6 +182,9 @@ def parse_question(raw_q):
         via = None
     else:
         mode = start = end = via = None
+        
+    if "public transport" in q.lower() or "metro" in q.lower() or "train" in q.lower():
+        P["mode"] = "public_transport"
 
     if start and end:
         def clean_route_endpoint(text):
@@ -203,36 +206,14 @@ def parse_question(raw_q):
                 via_clean = clean_route_endpoint(via)
                 P["poi_coords"] = geocode_point(via_clean)
                 print(f"📍 Route via: {via_clean} → {P['poi_coords']}")
+
+            # Add public transport flag if appropriate
+            if "public transport" in q.lower() or "metro" in q.lower() or "train" in q.lower():
+                P["mode"] = "public_transport"
+
             return P
         except Exception as e:
             print(f"⚠️ Failed geocoding route components: {e}")
-
-
-        # Heuristic cleaning: remove trailing fluff like "along the river"
-        def clean_route_endpoint(text):
-            text = clean_name(text)
-            # Remove common trailing descriptors
-            text = re.sub(r"\s+(along|via|past|through|near|by)\b.*", "", text)
-            return text
-
-        try:
-            start_clean = clean_route_endpoint(start)
-            end_clean = clean_route_endpoint(end)
-            P.update({
-                "start_coords": geocode_point(start_clean),
-                "end_coords": geocode_point(end_clean),
-                "mode": "route_via" if via else "route_check"
-            })
-            print(f"📍 Route start: {start_clean} → {P['start_coords']}")
-            print(f"📍 Route end: {end_clean} → {P['end_coords']}")
-            if via:
-                via_clean = clean_route_endpoint(via)
-                P["poi_coords"] = geocode_point(via_clean)
-                print(f"📍 Route via: {via_clean} → {P['poi_coords']}")
-            return P
-        except Exception as e:
-            print(f"⚠️ Failed geocoding route components: {e}")
-
 
     # Pet-friendly hotels
     if re.search(r"pet[- ]friendly", q, re.IGNORECASE) and P.get("center"):
@@ -320,7 +301,7 @@ def parse_question(raw_q):
     # Llama fallback for location extraction
     if not P.get("center"):
         try:
-            fallback_loc = extract_locations_llama(raw_q)
+            fallback_loc = extract_locations_llama_cached(raw_q)
             try:
                 P['center'] = geocode_point(fallback_loc)
             except:

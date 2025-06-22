@@ -13,7 +13,7 @@ import datetime
 from pydub import AudioSegment
 
 # — load Whisper model once —
-_model = whisper.load_model("base")  # choose "tiny"/"small"/"medium"/"large"
+_model = whisper.load_model("tiny")  # choose "base""tiny"/"small"/"medium"/"large"
 
 def _record_audio(
     max_silence: float = 5.0,

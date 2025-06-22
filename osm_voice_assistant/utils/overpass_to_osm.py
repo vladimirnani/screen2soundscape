@@ -11,7 +11,11 @@ from deep_translator import GoogleTranslator
 import string
 from geoparser import Geoparser
 from utils.llama_singleton import get_llm
-llm = get_llm()
+import requests
+from functools import lru_cache
+
+OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+_llm = get_llm()
 
 import contextlib, io
 
@@ -45,6 +49,38 @@ CUISINE_KEYWORDS = [
     "vegetarian", "vegan", "halal", "kosher"
 ]
 
+
+
+def run_overpass_query(query, endpoint="https://overpass-api.de/api/interpreter"):
+    """
+    Executes an Overpass QL query and returns the JSON results.
+    
+    Parameters:
+    - query: str, the Overpass QL query
+    - endpoint: str, optional Overpass endpoint URL
+
+    Returns:
+    - dict: Parsed JSON response from Overpass API
+    """
+    headers = {"Accept": "application/json"}
+    response = requests.post(endpoint, data={"data": query}, headers=headers, timeout=60)
+    response.raise_for_status()
+    return response.json()
+
+
+def run_overpass_query_cached(query, cache_dir="overpass_cache"):
+    os.makedirs(cache_dir, exist_ok=True)
+    key = hashlib.md5(query.encode()).hexdigest()
+    cache_path = os.path.join(cache_dir, f"{key}.json")
+    if os.path.exists(cache_path):
+        with open(cache_path, "r") as f:
+            return json.load(f)
+    result = run_overpass_query(query)
+    with open(cache_path, "w") as f:
+        json.dump(result, f)
+    return result
+
+
 def load_text(path):
     with open(path, "r", encoding="utf-8") as f:
         return [line.strip() for line in f if line.strip()]
@@ -68,6 +104,15 @@ def geocode_point(loc):
     if not place:
         raise ValueError(f"Could not geocode: {loc}")
     return place.latitude, place.longitude
+
+GEO_CACHE = {}
+def geocode_point_cached(loc):
+    if loc in GEO_CACHE:
+        return GEO_CACHE[loc]
+    latlon = geocode_point(loc)
+    GEO_CACHE[loc] = latlon
+    return latlon
+
 
 def geocode_bbox(loc):
     geo = Nominatim(user_agent="osmv", timeout=5)
@@ -93,7 +138,7 @@ def extract_location(q, doc):
             return None, None
         tried.add(cand)
         try:
-            _ = geocode_point(cand)
+            _ = geocode_point_cached(cand)
             return cand, source
         except:
             return None, None
@@ -134,6 +179,87 @@ def extract_locations_llama(text):
     return resp["choices"][0]["text"].strip()
 
 
+def get_nearby_landmarks(lat, lon, radius=50):
+    query = f"""
+    [out:json];
+    node(around:{radius},{lat},{lon})[amenity];
+    out;
+    """
+    results = run_overpass_query_cached(query)
+    return [el['tags'].get('name') for el in results.get('elements', []) if 'name' in el.get('tags', {})]
+
+
+def summarize_results(question: str, data: dict) -> str:
+    elements = data.get("elements", [])
+    count = len(elements)
+
+    # Compress context by extracting only top N points of interest
+    compressed = []
+    for el in elements[:5]:  # top 5 results only
+        tags = el.get("tags", {})
+        name = tags.get("name")
+        type_ = tags.get("amenity") or tags.get("shop") or tags.get("tourism") or tags.get("leisure")
+        address = tags.get("addr:street") or tags.get("addr:full") or "(no address)"
+
+        if name and type_:
+            compressed.append(f"- {name} ({type_}), located at {address}")
+        elif name:
+            compressed.append(f"- {name}, located at {address}")
+        elif type_:
+            compressed.append(f"- A {type_} located at {address}")
+
+    details = "\n".join(compressed) if compressed else "No detailed information available."
+
+    prompt = (
+        f"The user asked: \"{question}\"\n"
+        f"There are {count} matching places. Here are some of them:\n"
+        f"{details}\n"
+        "Summarize this into a clear and helpful spoken paragraph."
+    )
+
+    resp = _llm(prompt=prompt, max_tokens=150, temperature=0.3)
+    text = resp["choices"][0]["text"].strip().replace("\n", " ")
+
+    # De-duplicate sentences
+    seen, out = set(), []
+    for s in text.split(". "):
+        s = s.strip().rstrip(".")
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+
+    return ". ".join(out) + "."
+
+@lru_cache(maxsize=128)
+def summarize_results_cached(question, data):
+    return summarize_results(question, data)
+
+def summarize_route(directions_json):
+    try:
+        route = directions_json["routes"][0]
+        leg = route["legs"][0]
+        steps = leg["steps"]
+
+        lines = []
+        lines.append(f"The route is about {round(route['distance'] / 1000, 1)} kilometers and will take approximately {round(route['duration'] / 60)} minutes.")
+        lines.append("Here are the step-by-step directions:")
+
+        for i, step in enumerate(steps, 1):
+            maneuver = step["maneuver"]
+            instruction = f"{i}. {maneuver['instruction'] if 'instruction' in maneuver else maneuver.get('type', 'Move')}"
+            if 'name' in step and step['name']:
+                instruction += f" onto {step['name']}"
+            if step.get('duration'):
+                instruction += f" for about {round(step['duration'] / 60, 1)} minutes"
+            lines.append(instruction)
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        return f"⚠️ Could not summarize route: {e}"
+
+
+
 def parse_question(raw_q):
     q = detect_and_translate(raw_q)
     doc = nlp(q)
@@ -148,7 +274,7 @@ def parse_question(raw_q):
     loc, source = extract_location(q, doc)
     if loc:
         try:
-            P["center"] = geocode_point(loc)
+            P["center"] = geocode_point_cached(loc)
             P["place_name"] = loc
             P["loc_source"] = source
             print(f"📍 Location “{loc}” detected via {source} → geocoded with Nominatim")
@@ -193,15 +319,15 @@ def parse_question(raw_q):
             start_clean = clean_route_endpoint(start)
             end_clean = clean_route_endpoint(end)
             P.update({
-                "start_coords": geocode_point(start_clean),
-                "end_coords": geocode_point(end_clean),
+                "start_coords": geocode_point_cached(start_clean),
+                "end_coords": geocode_point_cached(end_clean),
                 "mode": "route_via" if via else "route_check"
             })
             print(f"📍 Route start: {start_clean} → {P['start_coords']}")
             print(f"📍 Route end: {end_clean} → {P['end_coords']}")
             if via:
                 via_clean = clean_route_endpoint(via)
-                P["poi_coords"] = geocode_point(via_clean)
+                P["poi_coords"] = geocode_point_cached(via_clean)
                 print(f"📍 Route via: {via_clean} → {P['poi_coords']}")
             return P
         except Exception as e:
@@ -219,15 +345,15 @@ def parse_question(raw_q):
             start_clean = clean_route_endpoint(start)
             end_clean = clean_route_endpoint(end)
             P.update({
-                "start_coords": geocode_point(start_clean),
-                "end_coords": geocode_point(end_clean),
+                "start_coords": geocode_point_cached(start_clean),
+                "end_coords": geocode_point_cached(end_clean),
                 "mode": "route_via" if via else "route_check"
             })
             print(f"📍 Route start: {start_clean} → {P['start_coords']}")
             print(f"📍 Route end: {end_clean} → {P['end_coords']}")
             if via:
                 via_clean = clean_route_endpoint(via)
-                P["poi_coords"] = geocode_point(via_clean)
+                P["poi_coords"] = geocode_point_cached(via_clean)
                 print(f"📍 Route via: {via_clean} → {P['poi_coords']}")
             return P
         except Exception as e:
@@ -276,7 +402,7 @@ def parse_question(raw_q):
     if m:
         dist, place = m.groups()
         try:
-            P["center"] = geocode_point(clean_name(place))
+            P["center"] = geocode_point_cached(clean_name(place))
             P.update({"radius": int(dist) * 1000, "mode": "generic"})
             return P
         except:
@@ -293,7 +419,7 @@ def parse_question(raw_q):
     if m:
         place_near = clean_name(m.group(1))
         try:
-            P['center'] = geocode_point(place_near)
+            P['center'] = geocode_point_cached(place_near)
             P.update({"mode": "generic", "radius": DEFAULT_RADIUS})
             P["place_name"] = place_near
             return P
@@ -322,7 +448,7 @@ def parse_question(raw_q):
         try:
             fallback_loc = extract_locations_llama(raw_q)
             try:
-                P['center'] = geocode_point(fallback_loc)
+                P['center'] = geocode_point_cached(fallback_loc)
             except:
                 # Retry with "in [city]" variants or append common type
                 retry_phrases = [
@@ -330,7 +456,7 @@ def parse_question(raw_q):
                 ]
                 for phrase in retry_phrases:
                     try:
-                        P['center'] = geocode_point(phrase)
+                        P['center'] = geocode_point_cached(phrase)
                         fallback_loc = phrase
                         print(f"📍 Retried LLaMA location as “{phrase}” → geocoded successfully")
                         break
@@ -349,6 +475,13 @@ def parse_question(raw_q):
     if P.get("center") and not P.get("mode"):
         P.update({"mode": "generic", "radius": DEFAULT_RADIUS})
     return P
+
+
+from functools import lru_cache
+
+@lru_cache(maxsize=128)
+def extract_locations_llama_cached(text):
+    return extract_locations_llama(text)
 
 
 def build_overpass_query(P):
@@ -398,6 +531,38 @@ def build_overpass_query(P):
 
 
     raise ValueError("No location (bbox or center) could be resolved.")
+
+
+def analyze_barriers(route_json, radius=15):
+    from utils.overpass_to_osm import run_overpass_query_cached
+    coords = []
+    for leg in route_json.get("routes", [])[0].get("legs", []):
+        for step in leg.get("steps", []):
+            for loc in step.get("geometry", {}).get("coordinates", []):
+                lon, lat = loc
+                coords.append((lat, lon))
+
+    barrier_tags = [
+        'barrier', 'highway=crossing', 'kerb', 'incline'
+    ]
+    obstacles = []
+    for lat, lon in coords[::10]:  # sample every ~10 points to reduce load
+        overpass_query = f"""
+        [out:json];
+        (
+          node(around:{radius},{lat},{lon})["barrier"];
+          node(around:{radius},{lat},{lon})["highway"="crossing"];
+          node(around:{radius},{lat},{lon})["kerb"];
+          node(around:{radius},{lat},{lon})["incline"];
+        );
+        out body;
+        """
+        result = run_overpass_query_cached(overpass_query)
+        for el in result.get("elements", []):
+            tag_desc = ", ".join(f"{k}={v}" for k, v in el.get("tags", {}).items())
+            obstacles.append(f"⚠️ Obstacle at ({el['lat']:.5f}, {el['lon']:.5f}): {tag_desc}")
+    return obstacles
+
 
 # Command-line interface
 if __name__ == "__main__":

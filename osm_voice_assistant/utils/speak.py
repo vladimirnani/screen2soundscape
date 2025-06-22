@@ -103,6 +103,15 @@ def speak(text: str, language: str, speaker_key: str, speed: float = 1.0, output
     print(f"[speak] ✅ Saved cloned TTS to '{out_path}'")
     return out_path
 
+AUDIO_CACHE = {}
+def speak_cached(text, language, speaker_key, speed):
+    key = f"{speaker_key}_{language}_{speed}_{hash(text)}"
+    if key in AUDIO_CACHE:
+        return AUDIO_CACHE[key]
+    path = speak(text, language, speaker_key, speed)
+    AUDIO_CACHE[key] = path
+    return path
+
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description="Generate cloned speech from text using OpenVoice + Melo TTS.")
     p.add_argument("text", help="The text to speak.")
