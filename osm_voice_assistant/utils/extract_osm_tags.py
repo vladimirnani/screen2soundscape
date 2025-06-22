@@ -1,5 +1,3 @@
-# extract_osm_tags.py
-
 import requests
 import json
 from pathlib import Path

@@ -39,6 +39,11 @@ else:
 
 STOPWORDS = {"is","a","an","the","in","on","at","of","to","from","with","for","near","by"}
 DEFAULT_RADIUS = 1000
+CUISINE_KEYWORDS = [
+    "chinese", "italian", "japanese", "indian", "thai", "mexican", "greek", "french",
+    "vietnamese", "turkish", "korean", "lebanese", "ethiopian", "burger", "pizza",
+    "vegetarian", "vegan", "halal", "kosher"
+]
 
 def load_text(path):
     with open(path, "r", encoding="utf-8") as f:
@@ -72,11 +77,19 @@ def geocode_bbox(loc):
     south, north, west, east = map(float, place.raw["boundingbox"])
     return south, west, north, east
 
+
+def is_probably_not_location(text):
+    food_words = {"restaurant", "cafe", "bar", "pizzeria", "bakery"}
+    cuisine_words = set(CUISINE_KEYWORDS)
+    tokens = set(text.lower().split())
+    return bool(tokens & food_words) and bool(tokens & cuisine_words)
+
 def extract_location(q, doc):
     tried = set()
+
     def try_geo(candidate, source):
         cand = clean_name(candidate)
-        if cand in tried:
+        if cand in tried or is_probably_not_location(cand):
             return None, None
         tried.add(cand)
         try:
@@ -105,10 +118,9 @@ def extract_location(q, doc):
             res, source = try_geo(chunk.text, "noun chunk")
             if res:
                 return res, source
-
     return None, None
 
-
+        
 def extract_locations_llama(text):
     prompt = (
         "Extract the names of specific places or locations mentioned in the sentence.\n\n"
@@ -143,13 +155,58 @@ def parse_question(raw_q):
         except Exception as e:
             print(f"⚠️ Failed geocoding extracted location {loc}: {e}")
 
+    
+    # Cuisine-specific restaurants
+    for cuisine in CUISINE_KEYWORDS:
+        if re.search(rf"\b{cuisine}\b", q, re.IGNORECASE) and P.get("center"):
+            P.update({
+                "tag_key": "cuisine", "tag_value": cuisine.lower(),
+                "extra_tag": '["amenity"="restaurant"]',
+                "mode": "generic", "radius": DEFAULT_RADIUS
+            })
+            return P
+
 
     # Route queries
-    m = re.search(
-        r"\b(walk|drive|bike|bus|train)\b.*?from\s+(.+?)\s+to\s+(.+?)(?:\s+(?:past|via)\s+(.+))?$",
-        q, re.IGNORECASE)
-    if m:
-        mode, start, end, via = m.groups()
+    # Full route query: "walk from A to B via C"
+    m1 = re.search(r"\b(walk|drive|bike|bus|train)\b.*?from\s+(.+?)\s+to\s+(.+?)(?:\s+(?:past|via)\s+(.+))?$", q, re.IGNORECASE)
+
+    # Simpler fallback: "from A to B"
+    m2 = re.search(r"\bfrom\s+(.+?)\s+to\s+(.+)", q, re.IGNORECASE)
+
+    if m1:
+        mode, start, end, via = m1.groups()
+    elif m2:
+        start, end = m2.groups()
+        mode = "walk"  # default if not specified
+        via = None
+    else:
+        mode = start = end = via = None
+
+    if start and end:
+        def clean_route_endpoint(text):
+            text = clean_name(text)
+            text = re.sub(r"\s+(along|via|past|through|near|by)\b.*", "", text)
+            return text
+
+        try:
+            start_clean = clean_route_endpoint(start)
+            end_clean = clean_route_endpoint(end)
+            P.update({
+                "start_coords": geocode_point(start_clean),
+                "end_coords": geocode_point(end_clean),
+                "mode": "route_via" if via else "route_check"
+            })
+            print(f"📍 Route start: {start_clean} → {P['start_coords']}")
+            print(f"📍 Route end: {end_clean} → {P['end_coords']}")
+            if via:
+                via_clean = clean_route_endpoint(via)
+                P["poi_coords"] = geocode_point(via_clean)
+                print(f"📍 Route via: {via_clean} → {P['poi_coords']}")
+            return P
+        except Exception as e:
+            print(f"⚠️ Failed geocoding route components: {e}")
+
 
         # Heuristic cleaning: remove trailing fluff like "along the river"
         def clean_route_endpoint(text):
@@ -296,6 +353,7 @@ def parse_question(raw_q):
 
 def build_overpass_query(P):
     tag_f = f'["{P.get("tag_key")}"="{P.get("tag_value")}"]' if P.get("tag_key") else ""
+    extra_tag = P.get("extra_tag", "")
     wh_f = '["wheelchair"="yes"]' if P.get("wheelchair_only") else ""
     pet_f = '["pets"="yes"]' if P.get("pet_friendly") else ""
     open_f = f'["opening_hours"~"{P.get("opening_hours_regex")}"]' if P.get("opening_hours_regex") else ""
@@ -332,10 +390,12 @@ def build_overpass_query(P):
         east = max(lon1, lon2) + 0.01
         return (
             "[out:json][timeout:25];(\n"
-            f"  way[\"leisure\"=\"park\"]({south},{west},{north},{east});\n"
-            f"  rel[\"leisure\"=\"park\"]({south},{west},{north},{east});\n"
+            f"  node{extra_tag}{tag_f}{wh_f}{pet_f}{open_f}{area};\n"
+            f"  way{extra_tag}{tag_f}{wh_f}{pet_f}{open_f}{area};\n"
+            f"  rel{extra_tag}{tag_f}{wh_f}{pet_f}{open_f}{area};\n"
             ");out center;"
         )
+
 
     raise ValueError("No location (bbox or center) could be resolved.")
 
