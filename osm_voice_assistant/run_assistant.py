@@ -173,15 +173,29 @@ def main(speaker, language, speed, save_json, text, text_file, batch_examples):
 
     # Translate if needed
     logger.info("🌍 Translating summary...")
-    lang_code = lang.lower()
+    lang_code = (lang or "unknown").lower()
     language_code = (language or "").lower()
-    translated_summary = summary
-    t4 = time.time()
-    if not (lang_code.startswith("en") and language_code.startswith("en")):
+
+    # Normalize language codes for GoogleTranslator
+    if language_code in {"en_newest", "en-us", "en_uk", "en_au"}:
+        language_code = "en"
+
+    translated_summary = summary  # Always define
+
+    t4 = time.time()  # ensure timing captured
+
+    if lang_code == "unknown":
+        logger.warning("⚠️ Could not detect language; skipping translation check, will translate as fallback.")
+        needs_translation = True
+    else:
+        needs_translation = not (lang_code.startswith("en") and language_code.startswith("en"))
+
+    if needs_translation:
         try:
             translated_summary = GoogleTranslator(source=lang_code, target=language_code).translate(summary)
         except Exception as e:
             logger.warning(f"⚠️ Translation failed: {e}")
+
     # Speak the response
     logger.info("🔊 Speaking...")
     try:
@@ -221,5 +235,5 @@ if __name__ == "__main__":
         save_json=args.save_json,
         text=args.text,
         text_file=args.text_file,
-        batch_examples=args.batch_examples  # ← PASS THIS ARG TOO
+        batch_examples=args.batch_examples
     )
