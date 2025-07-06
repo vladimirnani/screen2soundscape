@@ -43,3 +43,4 @@ desktop.ini
 node_modules/
 osm_voice_assistant/models/*.gguf
 osm_voice_assistant/checkpoints_v2/converter/checkpoint.pth
+"*.wav" 
