@@ -6,10 +6,16 @@ import io
 from llama_cpp import Llama
 
 # Resolve model path relative to project root
+# MODEL_PATH = os.path.join(
+#     os.path.dirname(os.path.dirname(__file__)),
+#     "models", "llama-2-7b-chat.Q4_K_M.gguf"
+# )
+
 MODEL_PATH = os.path.join(
     os.path.dirname(os.path.dirname(__file__)),
-    "models", "llama-2-7b-chat.Q4_K_M.gguf"
+    "models", "llama-3.2-3b-instruct-q6_k.gguf"
 )
+
 
 # Singleton instance
 _llm = None

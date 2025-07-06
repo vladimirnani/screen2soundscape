@@ -1,4 +1,5 @@
 # run_assistant.py
+# model used: https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF
 import warnings
 import transformers
 warnings.filterwarnings("ignore")

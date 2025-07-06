@@ -59,6 +59,8 @@ mkdir models
 cd models
 curl -L -o llama-2-7b-chat.Q4_K_M.gguf \
   https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/main/llama-2-7b-chat.Q4_K_M.gguf
+
+  https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q6_K.gguf
 ```
 
 ---

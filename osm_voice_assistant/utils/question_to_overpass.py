@@ -380,7 +380,174 @@ def build_overpass_query(P):
 
     raise ValueError("No location (bbox or center) could be resolved.")
 
+import json
+import re
+import contextlib
+import io
+from langdetect import detect
+
+def call_llama_parse_question(question, user_latlon=None, language="en"):
+    """
+    Calls LLaMA 3.2 instruct to parse the question into structured JSON.
+    """
+
+    system_prompt = (
+        "You are a geo assistant that parses user questions into structured JSON for generating OpenStreetMap Overpass queries. "
+        "Always output a JSON with the following keys:\n"
+        "location (string, if found),\n"
+        "tags (list of strings, detected relevant tags like 'cafe', 'restaurant', etc.),\n"
+        "mode (string, like 'walk', 'drive', 'public_transport'),\n"
+        "clarification_needed (boolean),\n"
+        "clarification_question (string).\n\n"
+        "If the user input is unclear, set clarification_needed to true and provide a clarifying question in clarification_question."
+    )
+
+    if user_latlon:
+        lat, lon = user_latlon
+        system_prompt += f"\n\nThe user's current location is approximately at latitude {lat}, longitude {lon}."
+
+    prompt = f"{system_prompt}\n\nUser input: {question}\n\nRespond ONLY with the JSON."
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        resp = llm(prompt, max_tokens=512, echo=False)
+
+    text_response = resp["choices"][0]["text"].strip()
+
+    try:
+        json_response = json.loads(text_response)
+        return json_response
+    except json.JSONDecodeError:
+        print("⚠️ LLaMA response was not valid JSON, raw response:", text_response)
+        # fallback to clarifying
+        return {
+            "location": None,
+            "tags": [],
+            "mode": None,
+            "clarification_needed": True,
+            "clarification_question": "Could you please clarify what location or place type you are looking for?"
+        }
+
+def parse_question_with_llama(raw_q, user_latlon=None):
+    lang = detect(raw_q)
+    is_french = lang == "fr"
+
+    llama_result = call_llama_parse_question(raw_q, user_latlon=user_latlon, language=lang)
+
+    if llama_result.get("clarification_needed", False):
+        clarification = llama_result.get("clarification_question", "Could you clarify your request?")
+        if is_french:
+            clarification = "Pouvez-vous préciser votre demande ?" if clarification == "Could you clarify your request?" else clarification
+        return {
+            "clarification_needed": True,
+            "clarification_question": clarification
+        }
+
+    location = llama_result.get("location")
+    tags = llama_result.get("tags", [])
+    mode = llama_result.get("mode")
+
+    P = {
+        "tag_key": None, "tag_value": None,
+        "mode": mode if mode else "generic",
+        "center": None, "bbox": None, "radius": 1000,
+        "wheelchair_only": False, "pet_friendly": False,
+        "opening_hours_regex": None,
+        "start_coords": None, "end_coords": None, "poi_coords": None,
+        "place_name": location,
+        "loc_source": "LLaMA 3.2",
+        "language": lang
+    }
+
+    # Handle “near me”
+    if location and location.lower() == "near me":
+        if user_latlon:
+            P["center"] = user_latlon
+            print("📍 Using user current location for 'near me'.")
+        else:
+            return {
+                "clarification_needed": True,
+                "clarification_question": "Could you please share your current location to find places near you?"
+            }
+    elif location:
+        try:
+            P["center"] = geocode_point(location)
+            print(f"📍 Geocoded location from LLaMA: {location} → {P['center']}")
+        except Exception as e:
+            print(f"⚠️ Failed to geocode {location} from LLaMA: {e}")
+
+    if tags:
+        # Use first tag detected for simplicity
+        tag = tags[0].lower()
+        if tag in TAG_MAP:
+            P["tag_key"], P["tag_value"] = TAG_MAP[tag]
+        else:
+            # fallback heuristic
+            P["tag_key"] = "amenity"
+            P["tag_value"] = tag
+
+    return P
+
 # Command-line interface
+# if __name__ == "__main__":
+#     input_arg = sys.argv[1] if len(sys.argv) > 1 else "examples"
+#     output_lines = []
+#     save_to_file = False
+#     output_filename = None
+
+#     if input_arg.lower() == "examples":
+#         examples = [
+#             "What is near Aula Magna right now?",
+#             "Are there any vegan restaurants near Aula Magna?",
+#             "What are the closest ATMs near Musée universitaire de Louvain?",
+#             "Which beaches near Lisbon are wheelchair accessible?",
+#             "Are there baby changing stations in Musée universitaire de Louvain?",
+#             "Show me cafes within 2 km of Amsterdam Central Station",
+#             "Find restaurants in Berlin",
+#             "Look for places near Eiffel Tower",
+#             "Where is Lyon?",
+#             "Is MOMA wheelchair accessible?",
+#             "What historical sites are near the Colosseum?",
+#             "Show me UNESCO World Heritage sites in India.",
+#             "Where can I find live jazz bars in New Orleans?",
+#             "What’s a good area for street food in Bangkok?",
+#             "Where can I find hostels near downtown Prague?",
+#             "Are there pet-friendly hotels in Zurich?",
+#             "Show me all libraries open past 8 PM in central London.",
+#             "Can I drive from Marseille to Nice via Avignon?",
+#             "Puis-je conduire de Marseille à Nice via Avignon ?",
+#             "How can I bike from Stanford University to Googleplex?",
+#             "What's the fastest public transport route from Heathrow to Covent Garden?",
+#             "Can I walk from the Louvre to Notre-Dame along the river?",
+#         ]
+#     elif os.path.isfile(input_arg):
+#         examples = load_text(input_arg)
+#         save_to_file = True
+#         base_name = os.path.splitext(os.path.basename(input_arg))[0]
+#         os.makedirs("overpass_query", exist_ok=True)
+#         output_filename = os.path.join("overpass_query", f"{base_name}_overpass.txt")
+#     else:
+#         print(f"❌ Input '{input_arg}' is not a valid file or 'examples'.")
+#         sys.exit(1)
+
+#     for ex in examples:
+#         print("Question:", ex)
+#         params = parse_question(ex)
+#         try:
+#             result = build_overpass_query(params)
+#             print("Overpass query or result:")
+#             print(result)
+#             if save_to_file:
+#                 output_lines.append(f"# {ex}\n{result}\n")
+#         except Exception as e:
+#             print("❌", e)
+#         print()
+
+#     if save_to_file and output_filename:
+#         with open(output_filename, "w", encoding="utf-8") as out_file:
+#             out_file.writelines(line if line.endswith("\n") else line + "\n" for line in output_lines)
+#         print(f"✅ Overpass queries saved to: {output_filename}")
+
+
 if __name__ == "__main__":
     input_arg = sys.argv[1] if len(sys.argv) > 1 else "examples"
     output_lines = []
@@ -423,19 +590,24 @@ if __name__ == "__main__":
         sys.exit(1)
 
     for ex in examples:
-        print("Question:", ex)
-        params = parse_question(ex)
+        print(f"\n🔹 Question: {ex}")
+        params = parse_question_with_llama(ex)
+
+        # Check if clarification is needed
+        if params.get("clarification_needed"):
+            print(f"❓ Clarification needed: {params.get('clarification_question')}")
+            continue  # Skip saving/processing if unclear
+
         try:
             result = build_overpass_query(params)
-            print("Overpass query or result:")
+            print("✅ Overpass query:")
             print(result)
             if save_to_file:
                 output_lines.append(f"# {ex}\n{result}\n")
         except Exception as e:
-            print("❌", e)
-        print()
+            print(f"❌ Failed to build query: {e}")
 
     if save_to_file and output_filename:
         with open(output_filename, "w", encoding="utf-8") as out_file:
             out_file.writelines(line if line.endswith("\n") else line + "\n" for line in output_lines)
-        print(f"✅ Overpass queries saved to: {output_filename}")
+        print(f"\n✅ Overpass queries saved to: {output_filename}")
