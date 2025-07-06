@@ -44,3 +44,4 @@ node_modules/
 osm_voice_assistant/models/*.gguf
 osm_voice_assistant/checkpoints_v2/converter/checkpoint.pth
 "*.wav" 
+"osm_voice_assistant/osm_assistant_speaker_audio/*.wav" 
