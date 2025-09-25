@@ -34,7 +34,6 @@ bus = &"STS"
 
 [node name="footstep" type="AudioStreamPlayer" parent="."]
 stream = ExtResource("3_thov6")
-volume_db = -18.024
 bus = &"STS"
 
 [node name="Timer" type="Timer" parent="."]
@@ -50,13 +49,11 @@ area_mask = 2049
 
 [node name="wall_audio" type="AudioStreamPlayer3D" parent="."]
 stream = ExtResource("5_wall")
-volume_db = -10.0
 bus = &"STS"
 
 [node name="rotate_audio" type="AudioStreamPlayer3D" parent="."]
-volume_db = -10.0
+volume_db = -30.0
 bus = &"STS"
 
 [node name="houses_audio" type="AudioStreamPlayer3D" parent="."]
-volume_db = -10.0
 bus = &"STS"

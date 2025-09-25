@@ -1,7 +1,7 @@
 extends CharacterBody3D
 
 # How fast the player moves in meters per second.
-@export var speed = 30
+@export var speed = 20
 #@export var speed = 14
 # The downward acceleration when in the air, in meters per second squared.
 @export var fall_acceleration = 75
@@ -62,6 +62,10 @@ func _input(event):
 					distance_audio.play()
 			elif not event.pressed and event.keycode == KEY_SHIFT:
 				distance_audio.stop()  # Stop when Shift is released
+				
+			if event.pressed and event.keycode == KEY_SHIFT:
+				if not distance_audio.playing: # Prevent re-triggering
+					distance_audio.play()
 			if event.pressed and event.keycode == KEY_E:
 				Speaker.speak('Road on the right.')
 			if event.pressed and event.keycode == KEY_Q:
@@ -75,6 +79,7 @@ func _input(event):
 					#Speaker.speak('To the elevator')
 			if event.pressed and event.keycode == KEY_T:
 				start_recording()
+				
 			elif not event.pressed and event.keycode == KEY_T:
 				stop_recording()
 			if event.pressed and event.keycode == KEY_F:
@@ -112,7 +117,7 @@ func _ready():
 	websocket_audio_player = get_node("../audio_streamer")
 
 	# Load the sliding sound
-	var sliding_sound = load("res://assets/sounds/sliding.mp3")
+	var sliding_sound = load("res://assets/audio/sliding.mp3")
 	if sliding_sound:
 		sliding_audio.stream = sliding_sound
 		sliding_audio.volume_db = -10  # Adjust volume as needed
@@ -139,7 +144,6 @@ func _ready():
 	var rotate_sound = load("res://assets/audio/rotate.wav")
 	if rotate_sound:
 		rotate_audio.stream = rotate_sound
-		rotate_audio.volume_db = -10  # Adjust volume as needed
 	else:
 		push_error("Could not load rotate.wav sound file")
 		
