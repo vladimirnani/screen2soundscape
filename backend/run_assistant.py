@@ -72,6 +72,43 @@ def detect_language(text: str) -> str:
     return code or "en"
 
 
+# ---------- Language helpers ----------
+_LANGUAGE_MAP = {
+    # normalize common variants to what translators expect
+    "en_us": "en", "en-gb": "en", "en_uk": "en",
+    "pt-br": "pt", "pt_br": "pt",
+    "zh-cn": "zh", "zh_cn": "zh",
+    "zh-tw": "zh-tw", "zh_tw": "zh-tw",
+    "sr-latn": "sr", "sr_cyrl": "sr",
+}
+
+def normalize_lang_code(lang: str) -> str:
+    """
+    Return a safe, short code for translation (e.g., 'nl_NL' -> 'nl').
+    """
+    if not lang:
+        return "en"
+    s = lang.lower().strip().replace("-", "_")
+    s = _LANGUAGE_MAP.get(s, s)
+    # Prefer the first segment (e.g., nl_NL -> nl)
+    return s.split("_")[0] if "_" in s else s
+
+def translate_text_from_en(text: str, target_lang: str) -> str:
+    """
+    Translate English text to target_lang (normalized).
+    Falls back to original text on failure.
+    """
+    tgt = normalize_lang_code(target_lang)
+    if tgt.startswith("en"):
+        return text
+    try:
+        tr = GoogleTranslator(source="en", target=tgt).translate(text)
+        return tr if tr else text
+    except Exception as e:
+        print(f"⚠️ Translation failed ({tgt}): {e}")
+        return text
+
+
 def get_question(text=None, text_file=None):
     if text:
         return text.strip()
@@ -211,8 +248,6 @@ def run_general(
             extra_args=extra_args,
         )
 
-        # We still print chunks live, but we do NOT TTS while streaming
-        # because we need the full text to translate first.
         print("🔊 Generating (BitNet in EN)...\n")
         for chunk in gen:
             print(chunk, end="", flush=True)  # English chunks to console
@@ -222,15 +257,13 @@ def run_general(
         response_en = "".join(collected).strip()
 
         # 6) Translate the English answer back to the user's language (if not English)
-        response_out = response_en
-        if not target_lang.startswith("en"):
-            try:
-                response_out = GoogleTranslator(source="en", target=target_lang).translate(response_en)
-            except Exception as e:
-                print(f"⚠️ Back-translation failed ({target_lang}): {e}")
-                response_out = response_en  # fall back to English
+        response_out = translate_text_from_en(response_en, target_lang)
 
-        # 7) Speak in the user's language
+        # 7) Print the localized text so the console doesn't look English-only
+        print("\n🗣️ Localized response:\n")
+        print(response_out, flush=True)
+
+        # 8) Speak in the user's language
         model_path_tts = find_best_piper_model(MODEL_DIR, language, speaker)
         return speak(
             response_out,
@@ -242,6 +275,7 @@ def run_general(
     except Exception as e:
         print(f"\n❌ BitNet inference failed: {e}")
         return ""
+
 
 def run_osm(
     question,
@@ -323,14 +357,14 @@ def run_osm(
         results = run_overpass_query(overpass_query)
         elements = results.get("elements", [])
     
-    if not elements and P.get("tag_key") == "shop":
+    if not elements and params.get("tag_key") == "shop":
         # temporarily broaden to supermarket|convenience
-        lat, lon = params["center"]
+        latc, lonc = params["center"]
         radius = params.get("radius", 1500)
         out_limit = params.get("out_limit", 300)
         overpass_query = (
             f'[out:json][timeout:25];'
-            f'(nwr(around:{radius},{lat},{lon})["shop"~"^(supermarket|convenience)$"];);'
+            f'(nwr(around:{radius},{latc},{lonc})["shop"~"^(supermarket|convenience)$"];);'
             f'out tags center qt {out_limit};'
         )
         results = run_overpass_query(overpass_query)
@@ -348,9 +382,9 @@ def run_osm(
     lat0, lon0 = params["center"]
     nearest = top_k_nearest(elements, lat0, lon0, k=k_nearest)
 
-    # ---- Build concise spoken summary ----
+    # ---- Build concise spoken summary (EN → localized) ----
     if not nearest:
-        spoken_text = "I didn't find any matching places nearby."
+        spoken_text_en = "I didn't find any matching places nearby."
     else:
         lines = []
         for i, item in enumerate(nearest, 1):
@@ -364,12 +398,13 @@ def run_osm(
                 kind = tags["shop"]
             kind_str = f" ({kind})" if kind else ""
             lines.append(f"{i}. {name}{kind_str} — {dist} meters away.")
-        spoken_text = "Here are the closest places: " + " ".join(lines)
+        spoken_text_en = "Here are the closest places: " + " ".join(lines)
 
+    # Localize + print
+    spoken_text = translate_text_from_en(spoken_text_en, language)
     print(spoken_text, flush=True)
 
-
-    # ---- TTS ----
+    # ---- TTS (localized) ----
     model_path = find_best_piper_model(MODEL_DIR, language, speaker)
     return speak(
         spoken_text,
@@ -459,7 +494,7 @@ def run_place_info(question, language, speaker, speed, output_mode, lat=None, lo
     # Reverse geocode (respect user language)
     try:
         headers = {"User-Agent": "screen2soundscape/1.0 (contact@example.com)"}
-        lang_short = (language or "en").split("_")[0].split("-")[0] or "en"
+        lang_short = normalize_lang_code(language or "en")
         r = requests.get(
             "https://nominatim.openstreetmap.org/reverse",
             params={
@@ -552,17 +587,8 @@ def run_place_info(question, language, speaker, speed, output_mode, lat=None, lo
         lines += ["", "A bit of local context:", wiki_snippet]
 
     summary_en = "\n".join(lines).strip()
-
-    lang_code = (language or "en").lower()
-    spoken_text = summary_en
-    if lang_code not in ["en", "en_us", "en-newest", "en_newest"]:
-        try:
-            spoken_text = GoogleTranslator(source="en", target=lang_code).translate(summary_en)
-        except Exception as e:
-            print(f"⚠️ Translation failed ({lang_code}): {e}")
-            spoken_text = summary_en
-
-    # ✅ PRINT BEFORE TTS so you immediately see the result
+    spoken_text = translate_text_from_en(summary_en, language)
+    # ✅ PRINT BEFORE TTS so you immediately see the localized result
     print(spoken_text, flush=True)
 
     # TTS — guard so failures don’t swallow output
